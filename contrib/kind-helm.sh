@@ -679,16 +679,10 @@ if [ "$OVN_ENABLE_DNSNAMERESOLVER" == true ]; then
     update_coredns_deployment_image
 fi
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
-  frr_port=0
-  if [ "$ENABLE_NO_OVERLAY_MANAGED_ROUTING" == true ]; then
-    # Enable bgp port listening on node, required for managed mode. FRR will listen on port 179 to receive BGP updates from other nodes.
-    frr_port=179
-  else
-    # external FRR is required for unmanaged mode
-    deploy_frr_external_container
-    deploy_bgp_external_server
+  if [ "$ENABLE_NO_OVERLAY_MANAGED_ROUTING" != true ]; then
+    run_bgp_setup deploy-frr
+    run_bgp_setup deploy-bgp-server
   fi
-  install_frr_k8s $frr_port
 fi
 if [ "$KIND_REMOVE_TAINT" == true ]; then
   remove_no_schedule_taint
@@ -733,11 +727,7 @@ if [ "$KIND_INSTALL_KUBEVIRT" == true ]; then
 fi
 
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
-  # wait for frr-k8s to be ready
-  wait_for_frr_k8s
-  if [ "$ENABLE_NO_OVERLAY_MANAGED_ROUTING" != true ]; then
-    configure_frr_k8s
-  fi
+  run_bgp_setup install-frr-k8s
 fi
 
 # IPsec pods need the signer-ca ConfigMap and signed CSRs before they can roll out.
