@@ -1228,9 +1228,9 @@ run_bgp_setup() {
     go build -o _output/bin/bgp-setup ./cmd/bgp-setup
     popd > /dev/null
   fi
-
+  
   echo "Running bgp-setup with phase: $phase"
-
+  
   # Determine IPv4/IPv6 flags
   local ipv4_flag="${PLATFORM_IPV4_SUPPORT:-true}"
   local ipv6_flag="${PLATFORM_IPV6_SUPPORT:-false}"
