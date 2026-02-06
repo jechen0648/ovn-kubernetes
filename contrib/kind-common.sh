@@ -644,6 +644,10 @@ install_metallb() {
     "tag: ${FRR_K8S_UPSTREAM_FRR_IMAGE##*:}" \
     "tag: ${FRR_DEPLOYED_IMAGE##*:}"
 
+  # Fix for newer Docker versions that don't accept --ulimit core=-1
+  # The -1 value is interpreted as a flag, not a value. Remove it entirely.
+  sed -i 's/--ulimit core=-1 //g' tasks.py
+
   pip install -r dev-env/requirements.txt
 
   local ip_family ipv6_network
