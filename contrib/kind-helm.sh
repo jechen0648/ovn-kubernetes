@@ -679,7 +679,10 @@ if [ "$OVN_ENABLE_DNSNAMERESOLVER" == true ]; then
     update_coredns_deployment_image
 fi
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
-  if [ "$ENABLE_NO_OVERLAY_MANAGED_ROUTING" != true ]; then
+  if [ "$ENABLE_NO_OVERLAY_MANAGED_ROUTING" == true ]; then
+    # Managed routing: install frr-k8s with bgpd on port 179 before OVN
+    run_bgp_setup install-frr-k8s "--bgp-port=179"
+  else
     # Phase 1a: Deploy external FRR container (before OVN installation)
     run_bgp_setup deploy-frr
 
@@ -719,7 +722,7 @@ if [ "$KIND_INSTALL_METALLB" == true ]; then
   install_metallb
 fi
 if [ "$KIND_INSTALL_PLUGINS" == true ]; then
-..  install_plugins
+  install_plugins
 fi
 if [ "$KIND_INSTALL_KUBEVIRT" == true ]; then
   install_kubevirt
@@ -730,8 +733,10 @@ if [ "$KIND_INSTALL_KUBEVIRT" == true ]; then
 fi
 
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
-  # Phase 2: Install frr-k8s and create FRRConfiguration (after OVN is installed)
-  run_bgp_setup install-frr-k8s
+  if [ "$ENABLE_NO_OVERLAY_MANAGED_ROUTING" != true ]; then
+    # Phase 2: Install frr-k8s and create FRRConfiguration (after OVN is installed)
+    run_bgp_setup install-frr-k8s
+  fi
 fi
 
 # IPsec pods need the signer-ca ConfigMap and signed CSRs before they can roll out.

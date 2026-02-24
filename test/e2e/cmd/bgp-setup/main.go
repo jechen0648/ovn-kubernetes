@@ -15,7 +15,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -145,6 +147,18 @@ func frrK8sRemoteURL(version, path string) string {
 	return fmt.Sprintf("https://raw.githubusercontent.com/metallb/frr-k8s/%s/%s", version, path)
 }
 
+func downloadURL(url string) ([]byte, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status %d for %s", resp.StatusCode, url)
+	}
+	return io.ReadAll(resp.Body)
+}
+
 // Config holds the configuration for BGP setup
 type Config struct {
 	ContainerRuntime        string
@@ -162,6 +176,7 @@ type Config struct {
 	UseDirectAPI            bool
 	TestdataPath            string
 	ClusterName             string
+	BGPPort                 int
 }
 
 func main() {
@@ -224,6 +239,7 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.AdvertiseDefaultNetwork, "advertise-default-network", getBoolEnvOrDefault(envAdvertiseDefaultNetwork, true), "Add pod network routes for default network advertisement")
 	flag.StringVar(&cfg.Kubeconfig, "kubeconfig", getEnvOrDefault(envKubeconfig, filepath.Join(os.Getenv("HOME"), ".kube", "config")), "Path to kubeconfig file")
 	flag.StringVar(&cfg.ClusterName, "cluster-name", getEnvOrDefault(envClusterName, defaultClusterName), "Kind cluster name. Used to derive control-plane container name (${cluster-name}-control-plane)")
+	flag.IntVar(&cfg.BGPPort, "bgp-port", 0, "BGP port for frr-k8s daemon (0 = default/disabled, 179 = managed routing)")
 	flag.BoolVar(&cfg.CleanupOnly, "cleanup", false, "Only cleanup existing BGP infrastructure")
 	flag.BoolVar(&cfg.UseDirectAPI, "use-direct-api", false, "Use direct API server address (control plane container IP) instead of kubeconfig server. Only works when Docker bridge network is routable from host.")
 	flag.StringVar(&cfg.TestdataPath, "testdata-path", getEnvOrDefault(envTestdataPath, ""), "Path to the testdata/routeadvertisements directory containing templates. Required when built with -trimpath.")
@@ -306,17 +322,21 @@ func run(cfg *Config) error {
 			return fmt.Errorf("failed to install frr-k8s: %w", err)
 		}
 
-		// Create FRRConfiguration to establish BGP peering between cluster nodes and the external FRR router.
-		fmt.Println("\n====================== Creating FRRConfiguration for BGP peering ======================")
-		if err := createFRRConfiguration(cfg); err != nil {
-			return fmt.Errorf("failed to create FRRConfiguration: %w", err)
-		}
+		// In managed routing mode (--bgp-port != 0), frr-k8s handles BGP
+		// internally so we skip FRRConfiguration and pod route setup.
+		if cfg.BGPPort == 0 {
+			// Create FRRConfiguration to establish BGP peering between cluster nodes and the external FRR router.
+			fmt.Println("\n====================== Creating FRRConfiguration for BGP peering ======================")
+			if err := createFRRConfiguration(cfg); err != nil {
+				return fmt.Errorf("failed to create FRRConfiguration: %w", err)
+			}
 
-		// Add routes for pod networks if `--advertise-default-network=true`
-		if cfg.AdvertiseDefaultNetwork {
-			fmt.Println("\n====================== Adding routes for pod networks ======================")
-			if err := addPodNetworkRoutes(cfg, clientset); err != nil {
-				fmt.Printf("Warning: failed to add pod network routes: %v\n", err)
+			// Add routes for pod networks if `--advertise-default-network=true`
+			if cfg.AdvertiseDefaultNetwork {
+				fmt.Println("\n====================== Adding routes for pod networks ======================")
+				if err := addPodNetworkRoutes(cfg, clientset); err != nil {
+					fmt.Printf("Warning: failed to add pod network routes: %v\n", err)
+				}
 			}
 		}
 	}
@@ -423,13 +443,24 @@ func setupKubectlServer() error {
 	// Get control plane container IP on the kind network specifically
 	output, err := runCmdOutput(runtime, "inspect", "-f", "{{.NetworkSettings.Networks.kind.IPAddress}}", controlPlaneNodeName)
 	if err != nil {
-		return fmt.Errorf("failed to get control plane IP for %s: %w", controlPlaneNodeName, err)
+		return fmt.Errorf("failed to get control plane IPv4 for %s: %w", controlPlaneNodeName, err)
 	}
 	ip := strings.TrimSpace(output)
 	if ip == "" {
-		return fmt.Errorf("control plane IP is empty for %s", controlPlaneNodeName)
+		output, err = runCmdOutput(runtime, "inspect", "-f", "{{.NetworkSettings.Networks.kind.GlobalIPv6Address}}", controlPlaneNodeName)
+		if err != nil {
+			return fmt.Errorf("failed to get control plane IPv6 for %s: %w", controlPlaneNodeName, err)
+		}
+		ip = strings.TrimSpace(output)
+		if ip == "" {
+			return fmt.Errorf("control plane IP is empty for %s", controlPlaneNodeName)
+		}
 	}
-	kubectlServer = fmt.Sprintf("https://%s:6443", ip)
+	if strings.Contains(ip, ":") {
+		kubectlServer = fmt.Sprintf("https://[%s]:6443", ip)
+	} else {
+		kubectlServer = fmt.Sprintf("https://%s:6443", ip)
+	}
 	fmt.Printf("Using direct API server address: %s\n", kubectlServer)
 	return nil
 }
@@ -849,10 +880,36 @@ func installFRRK8s(cfg *Config) error {
 		return fmt.Errorf("API server not ready: %w", err)
 	}
 
-	// Apply frr-k8s deployment from remote URL
+	// Download frr-k8s manifest, patch the unavailable gcr.io image, then apply.
+	// gcr.io/kubebuilder/kube-rbac-proxy is unavailable after Google Container
+	// Registry shutdown (https://cloud.google.com/container-registry/docs/deprecations/container-registry-deprecation).
+	// Upstream bug: https://github.com/metallb/metallb/issues/2619
 	frrK8sURL := frrK8sRemoteURL(cfg.FRRK8sVersion, "config/all-in-one/frr-k8s.yaml")
-	fmt.Printf("Applying frr-k8s deployment from %s...\n", frrK8sURL)
-	if err := runKubectlWithRetry(3, "apply", "--validate=false", "-f", frrK8sURL); err != nil {
+	fmt.Printf("Downloading frr-k8s deployment from %s...\n", frrK8sURL)
+	yamlBytes, err := downloadURL(frrK8sURL)
+	if err != nil {
+		return fmt.Errorf("failed to download frr-k8s manifest: %w", err)
+	}
+	yamlContent := strings.ReplaceAll(string(yamlBytes), "gcr.io/kubebuilder/kube-rbac-proxy", "registry.k8s.io/kubebuilder/kube-rbac-proxy")
+	if cfg.BGPPort != 0 {
+		if !strings.Contains(yamlContent, "-p 0") {
+			return fmt.Errorf("expected bgpd_options with '-p 0' not found in frr-k8s manifest")
+		}
+		yamlContent = strings.Replace(yamlContent, "-p 0", fmt.Sprintf("-p %d", cfg.BGPPort), 1)
+		fmt.Printf("Patched bgpd port to %d for managed routing\n", cfg.BGPPort)
+	}
+	tmpFile, err := os.CreateTemp("", "frr-k8s-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	if _, err := tmpFile.WriteString(yamlContent); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to write patched manifest: %w", err)
+	}
+	tmpFile.Close()
+	fmt.Println("Applying patched frr-k8s deployment...")
+	if err := runKubectlWithRetry(3, "apply", "--validate=false", "-f", tmpFile.Name()); err != nil {
 		return fmt.Errorf("failed to apply frr-k8s: %w", err)
 	}
 

@@ -1534,7 +1534,7 @@ delete() {
     echo "Cleaning up stale endpoints from kind network..."
     for endpoint in $stale_endpoints; do
       # Only disconnect endpoints belonging to this cluster or frr
-      if [[ "$endpoint" == "${cluster_name}-"* ]] || [[ "$endpoint" == "frr" ]]; then
+      if [[ "$endpoint" == "${cluster_name}-"* ]] || [[ "$endpoint" == "frr" ]] || [[ "$endpoint" == "bgpserver" ]]; then
         $OCI_BIN network disconnect -f kind "$endpoint" 2>/dev/null || true
       fi
     done
