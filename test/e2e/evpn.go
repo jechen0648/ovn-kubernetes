@@ -618,6 +618,17 @@ func secondToLastIP(ipNet *net.IPNet) net.IP {
 	return result
 }
 
+// decrementIP subtracts 1 from the given IP in place.
+func decrementIP(ip net.IP) {
+	for i := len(ip) - 1; i >= 0; i-- {
+		if ip[i] > 0 {
+			ip[i]--
+			return
+		}
+		ip[i] = 0xff
+	}
+}
+
 // getMACVRFAgnhostIPsFromSubnets derives MAC-VRF agnhost IPs from CUDN subnets.
 // For each subnet, it returns an IP with host portion set to the high end address.
 // Example: "10.100.0.0/16" -> "10.100.0.253/16", "fd00:100::/64" -> "fd00:100::ffff:ffff:ffff:fffe"
@@ -1168,6 +1179,49 @@ func copyEnvMap(m map[string]string) map[string]string {
 		cp[k] = v
 	}
 	return cp
+}
+
+// =============================================================================
+// FRR-K8s EVPN Control Plane Utilities
+// =============================================================================
+
+// getFRRK8sPodOnNode returns the frr-k8s daemon pod running on the given node.
+// The frr-k8s daemonset deploys one pod per node; pods are named frr-k8s-daemon-*.
+func getFRRK8sPodOnNode(f *framework.Framework, nodeName string) (*corev1.Pod, error) {
+	pods, err := f.ClientSet.CoreV1().Pods(deploymentconfig.Get().FRRK8sNamespace()).List(context.Background(), metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + nodeName,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods in %s: %w", deploymentconfig.Get().FRRK8sNamespace(), err)
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		ready := false
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if strings.HasPrefix(pod.Name, "frr-k8s-daemon-") &&
+			pod.Status.Phase == corev1.PodRunning &&
+			pod.DeletionTimestamp == nil &&
+			ready {
+			return pod, nil
+		}
+	}
+	return nil, fmt.Errorf("no running and ready frr-k8s daemon pod found on node %s", nodeName)
+}
+
+// execVtyshOnFRRK8s runs a vtysh command in the frr container of the frr-k8s pod on the given node.
+// vtyshCmd is the full vtysh -c argument, e.g. "show bgp l2vpn evpn route type multicast".
+func execVtyshOnFRRK8s(f *framework.Framework, nodeName string, vtyshCmd string) (string, error) {
+	pod, err := getFRRK8sPodOnNode(f, nodeName)
+	if err != nil {
+		return "", err
+	}
+	args := []string{"exec", pod.Name, "-c", "frr", "--", "vtysh", "-c", vtyshCmd}
+	return e2ekubectl.RunKubectl(deploymentconfig.Get().FRRK8sNamespace(), args...)
 }
 
 // =============================================================================
