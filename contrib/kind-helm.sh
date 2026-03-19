@@ -429,6 +429,8 @@ fi
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
   deploy_frr_external_container
   deploy_bgp_external_server
+  deploy_ebgp_frr_external_container
+  deploy_ebgp_external_server
 fi
 if [ "$KIND_REMOVE_TAINT" == true ]; then
   remove_no_schedule_taint

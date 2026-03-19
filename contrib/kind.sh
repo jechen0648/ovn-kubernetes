@@ -1070,6 +1070,8 @@ fi
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
   deploy_frr_external_container
   deploy_bgp_external_server
+  deploy_ebgp_frr_external_container
+  deploy_ebgp_external_server
 fi
 build_ovn_image
 detect_apiserver_url
