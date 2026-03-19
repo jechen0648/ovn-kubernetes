@@ -134,6 +134,10 @@ set_common_default_params() {
   ADVERTISED_UDN_ISOLATION_MODE=${ADVERTISED_UDN_ISOLATION_MODE:-strict}
   BGP_SERVER_NET_SUBNET_IPV4=${BGP_SERVER_NET_SUBNET_IPV4:-172.26.0.0/16}
   BGP_SERVER_NET_SUBNET_IPV6=${BGP_SERVER_NET_SUBNET_IPV6:-fc00:f853:ccd:e796::/64}
+  BGP_EBGP_SERVER_NET_SUBNET_IPV4=${BGP_EBGP_SERVER_NET_SUBNET_IPV4:-172.28.0.0/16}
+  BGP_EBGP_SERVER_NET_SUBNET_IPV6=${BGP_EBGP_SERVER_NET_SUBNET_IPV6:-fc00:f853:ccd:e798::/64}
+  BGP_CLUSTER_ASN=${BGP_CLUSTER_ASN:-64512}
+  BGP_EBGP_ASN=${BGP_EBGP_ASN:-64513}
   OVN_OBSERV_ENABLE=${OVN_OBSERV_ENABLE:-false}
   OVN_EMPTY_LB_EVENTS=${OVN_EMPTY_LB_EVENTS:-false}
   OVN_NETWORK_QOS_ENABLE=${OVN_NETWORK_QOS_ENABLE:-false}
@@ -1394,6 +1398,208 @@ set_nodes_default_gw() {
   done
 }
 
+deploy_ebgp_frr_external_container() {
+  echo "Deploying eBGP FRR external container (ASN ${BGP_EBGP_ASN})..."
+
+  # Discover kind cluster node IPs to configure as BGP neighbors
+  local node_ips_v4="" node_ips_v6=""
+  KIND_NODES=$(kind_get_nodes)
+  for node in $KIND_NODES; do
+    if [ "$PLATFORM_IPV4_SUPPORT" == true ]; then
+      local v4
+      v4=$($OCI_BIN inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' "$node") || return 1
+      [ -n "$v4" ] && node_ips_v4="${node_ips_v4} ${v4}"
+    fi
+    if [ "$PLATFORM_IPV6_SUPPORT" == true ]; then
+      local v6
+      v6=$($OCI_BIN inspect -f '{{.NetworkSettings.Networks.kind.GlobalIPv6Address}}' "$node") || return 1
+      [ -n "$v6" ] && node_ips_v6="${node_ips_v6} ${v6}"
+    fi
+  done
+
+  # Generate eBGP FRR config (ASN differs from cluster ASN, no route-reflector-client)
+  local frr_conf_dir
+  frr_conf_dir=$(mktemp -d)
+
+  # Write daemons file
+  cat > "${frr_conf_dir}/daemons" <<'DEOF'
+bgpd=yes
+zebra=yes
+DEOF
+
+  # vtysh.conf is required because the entire frr_conf_dir is volume-mounted
+  # as /etc/frr, hiding the image's built-in copy.
+  cat > "${frr_conf_dir}/vtysh.conf" <<'VEOF'
+service integrated-vtysh-config
+VEOF
+
+  # Write FRR config
+  cat > "${frr_conf_dir}/frr.conf" <<FEOF
+debug zebra events
+debug zebra nht detailed
+debug zebra kernel
+debug zebra rib detail
+debug zebra nexthop detail
+debug bgp keepalives
+debug bgp neighbor-events
+debug bgp nht
+debug bgp updates
+debug bgp zebra
+log stdout debugging
+log syslog debugging
+log file /etc/frr/frr.log debugging
+router bgp ${BGP_EBGP_ASN}
+ no bgp default ipv4-unicast
+ no bgp default ipv6-unicast
+ no bgp network import-check
+ no bgp ebgp-requires-policy
+FEOF
+
+  for ip in $node_ips_v4; do
+    cat >> "${frr_conf_dir}/frr.conf" <<FEOF
+ neighbor ${ip} remote-as ${BGP_CLUSTER_ASN}
+ neighbor ${ip} timers connect 10
+ neighbor ${ip} timers 3 15
+FEOF
+  done
+  for ip in $node_ips_v6; do
+    cat >> "${frr_conf_dir}/frr.conf" <<FEOF
+ neighbor ${ip} remote-as ${BGP_CLUSTER_ASN}
+ neighbor ${ip} timers connect 10
+ neighbor ${ip} timers 3 15
+FEOF
+  done
+
+  if [ -n "$node_ips_v4" ]; then
+    cat >> "${frr_conf_dir}/frr.conf" <<FEOF
+ address-family ipv4 unicast
+FEOF
+    for ip in $node_ips_v4; do
+      cat >> "${frr_conf_dir}/frr.conf" <<FEOF
+  neighbor ${ip} activate
+  neighbor ${ip} next-hop-self
+FEOF
+    done
+    cat >> "${frr_conf_dir}/frr.conf" <<FEOF
+  network ${BGP_EBGP_SERVER_NET_SUBNET_IPV4}
+ exit-address-family
+FEOF
+  fi
+
+  if [ -n "$node_ips_v6" ]; then
+    cat >> "${frr_conf_dir}/frr.conf" <<FEOF
+ address-family ipv6 unicast
+FEOF
+    for ip in $node_ips_v6; do
+      cat >> "${frr_conf_dir}/frr.conf" <<FEOF
+  neighbor ${ip} activate
+  neighbor ${ip} next-hop-self
+FEOF
+    done
+    cat >> "${frr_conf_dir}/frr.conf" <<FEOF
+  network ${BGP_EBGP_SERVER_NET_SUBNET_IPV6}
+ exit-address-family
+FEOF
+  fi
+
+  echo "eBGP FRR config:"
+  cat "${frr_conf_dir}/frr.conf"
+
+  # Start the eBGP FRR container
+  $OCI_BIN rm -f frr-ebgp 2>/dev/null || true
+  $OCI_BIN run -d --privileged --network kind --rm --name frr-ebgp \
+    --volume "${frr_conf_dir}:/etc/frr" \
+    quay.io/frrouting/frr:10.4.2
+
+  if [ "$PLATFORM_IPV6_SUPPORT" == true ]; then
+    $OCI_BIN exec frr-ebgp sysctl -w net.ipv6.conf.all.forwarding=1
+    $OCI_BIN exec frr-ebgp sysctl -w net.ipv6.conf.all.keep_addr_on_down=1
+  fi
+
+  if [ "$ENABLE_EVPN" == true ]; then
+    echo "Configuring global EVPN BGP on eBGP external FRR..."
+    # Wait for bgpd to finish loading the neighbor configuration
+    local retries=0 bgp_neighbors
+    while true; do
+      bgp_neighbors=$($OCI_BIN exec frr-ebgp vtysh -c "show running-config" 2>/dev/null | grep "^ neighbor.*remote-as" | awk '{print $2}' || true)
+      [ -n "$bgp_neighbors" ] && break
+      retries=$((retries + 1))
+      if [ "$retries" -ge 30 ]; then
+        echo "ERROR: frr-ebgp BGP neighbors not found in running-config after 30 seconds"
+        return 1
+      fi
+      sleep 1
+    done
+    local vtysh_cmds
+    vtysh_cmds=(-c "configure terminal" -c "router bgp ${BGP_EBGP_ASN}" -c "address-family l2vpn evpn")
+    for neighbor in $bgp_neighbors; do
+      vtysh_cmds+=(-c "neighbor $neighbor activate")
+    done
+    vtysh_cmds+=(-c "advertise-all-vni" -c "exit-address-family" -c "end")
+    $OCI_BIN exec frr-ebgp vtysh "${vtysh_cmds[@]}"
+    # write memory requires all daemons (zebra) to be fully up; retry separately
+    retries=0
+    while ! $OCI_BIN exec frr-ebgp vtysh -c "write memory" 2>/dev/null; do
+      retries=$((retries + 1))
+      if [ "$retries" -ge 30 ]; then
+        echo "WARNING: frr-ebgp write memory failed after 30 seconds, continuing anyway"
+        break
+      fi
+      sleep 1
+    done
+    echo "Global EVPN BGP config complete on eBGP external FRR"
+  fi
+
+  echo "eBGP FRR external container deployed"
+}
+
+deploy_ebgp_external_server() {
+  echo "Deploying eBGP external server..."
+  local ip_family ipv6_network
+  if [ "$PLATFORM_IPV4_SUPPORT" == true ] && [ "$PLATFORM_IPV6_SUPPORT" == true ]; then
+    ip_family="dual"
+    ipv6_network="--ipv6 --subnet=${BGP_EBGP_SERVER_NET_SUBNET_IPV6}"
+  elif  [ "$PLATFORM_IPV6_SUPPORT" == true ]; then
+    ip_family="ipv6"
+    ipv6_network="--ipv6 --subnet=${BGP_EBGP_SERVER_NET_SUBNET_IPV6}"
+  else
+    ip_family="ipv4"
+    ipv6_network=""
+  fi
+  $OCI_BIN rm -f bgpserver-ebgp 2>/dev/null || true
+  $OCI_BIN network rm -f bgpnet-ebgp 2>/dev/null || true
+  $OCI_BIN network create --subnet="${BGP_EBGP_SERVER_NET_SUBNET_IPV4}" ${ipv6_network} --driver bridge bgpnet-ebgp
+  $OCI_BIN network connect bgpnet-ebgp frr-ebgp
+  $OCI_BIN run --cap-add NET_ADMIN --user 0 -d --network bgpnet-ebgp --rm --name bgpserver-ebgp \
+    registry.k8s.io/e2e-test-images/agnhost:2.45 netexec
+
+  local bgp_network_frr_v4 bgp_network_frr_v6
+  bgp_network_frr_v4=$($OCI_BIN inspect -f '{{(index .NetworkSettings.Networks "bgpnet-ebgp").IPAddress}}' frr-ebgp)
+  echo "eBGP FRR bgp network IPv4: ${bgp_network_frr_v4}"
+  $OCI_BIN exec bgpserver-ebgp ip route replace default via "$bgp_network_frr_v4"
+  if [ "$PLATFORM_IPV6_SUPPORT" == true ]; then
+    bgp_network_frr_v6=$($OCI_BIN inspect -f '{{(index .NetworkSettings.Networks "bgpnet-ebgp").GlobalIPv6Address}}' frr-ebgp)
+    echo "eBGP FRR bgp network IPv6: ${bgp_network_frr_v6}"
+    $OCI_BIN exec bgpserver-ebgp ip -6 route replace default via "$bgp_network_frr_v6"
+  fi
+
+  if [ "$ADVERTISED_UDN_ISOLATION_MODE" == "loose" ]; then
+    local kind_network_frr_v4 kind_network_frr_v6
+    kind_network_frr_v4=$($OCI_BIN inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' frr-ebgp)
+    set_nodes_default_gw "$kind_network_frr_v4"
+    if [ "$PLATFORM_IPV6_SUPPORT" == true ]; then
+      kind_network_frr_v6=$($OCI_BIN inspect -f '{{.NetworkSettings.Networks.kind.GlobalIPv6Address}}' frr-ebgp)
+      set_nodes_default_gw "$kind_network_frr_v6"
+    fi
+  else
+    # Disable default route on eBGP FRR to only route via learnt/connected networks
+    $OCI_BIN exec frr-ebgp ip route delete default 2>/dev/null || true
+    $OCI_BIN exec frr-ebgp ip -6 route delete default 2>/dev/null || true
+  fi
+
+  echo "eBGP external server deployed"
+}
+
 destroy_bgp() {
   if $OCI_BIN ps --format '{{.Names}}' | grep -Eq '^bgpserver$'; then
       $OCI_BIN stop bgpserver
@@ -1403,6 +1609,15 @@ destroy_bgp() {
   fi
   if $OCI_BIN network ls --format '{{.Name}}' | grep -q '^bgpnet$'; then
       $OCI_BIN network rm bgpnet
+  fi
+  if $OCI_BIN ps --format '{{.Names}}' | grep -Eq '^bgpserver-ebgp$'; then
+      $OCI_BIN stop bgpserver-ebgp
+  fi
+  if $OCI_BIN ps --format '{{.Names}}' | grep -Eq '^frr-ebgp$'; then
+      $OCI_BIN stop frr-ebgp
+  fi
+  if $OCI_BIN network ls --format '{{.Name}}' | grep -q '^bgpnet-ebgp$'; then
+      $OCI_BIN network rm bgpnet-ebgp
   fi
 }
 
@@ -1493,6 +1708,52 @@ EOF
   fi
 
   kubectl apply -n frr-k8s-system -f receive_filtered.yaml
+
+  # If eBGP FRR container is running, create an FRRConfiguration for the eBGP peer
+  if $OCI_BIN ps --format '{{.Names}}' | grep -Eq '^frr-ebgp$'; then
+    echo "Creating FRRConfiguration for eBGP peer..."
+    local ebgp_frr_v4 ebgp_frr_v6
+    ebgp_frr_v4=$($OCI_BIN inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' frr-ebgp)
+
+    cat > receive_ebgp_filtered.yaml <<EOFEBGP
+apiVersion: frrk8s.metallb.io/v1beta1
+kind: FRRConfiguration
+metadata:
+  name: receive-ebgp-filtered
+  namespace: frr-k8s-system
+  labels:
+    name: receive-all
+spec:
+  bgp:
+    routers:
+    - asn: ${BGP_CLUSTER_ASN}
+      neighbors:
+      - address: ${ebgp_frr_v4}
+        asn: ${BGP_EBGP_ASN}
+        disableMP: true
+        toReceive:
+          allowed:
+            mode: filtered
+            prefixes:
+            - prefix: ${BGP_EBGP_SERVER_NET_SUBNET_IPV4}
+EOFEBGP
+    if [ "$PLATFORM_IPV6_SUPPORT" == true ]; then
+      ebgp_frr_v6=$($OCI_BIN inspect -f '{{.NetworkSettings.Networks.kind.GlobalIPv6Address}}' frr-ebgp)
+      # Add IPv6 neighbor and prefix
+      cat >> receive_ebgp_filtered.yaml <<EOFEBGP6
+      - address: ${ebgp_frr_v6}
+        asn: ${BGP_EBGP_ASN}
+        disableMP: true
+        toReceive:
+          allowed:
+            mode: filtered
+            prefixes:
+            - prefix: ${BGP_EBGP_SERVER_NET_SUBNET_IPV6}
+EOFEBGP6
+    fi
+    kubectl apply -n frr-k8s-system -f receive_ebgp_filtered.yaml
+  fi
+
   popd || exit 1
 
   rm -rf "${FRR_TMP_DIR}"

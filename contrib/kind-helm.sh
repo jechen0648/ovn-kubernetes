@@ -687,6 +687,8 @@ if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
     # external FRR is required for unmanaged mode
     deploy_frr_external_container
     deploy_bgp_external_server
+    deploy_ebgp_frr_external_container
+    deploy_ebgp_external_server
   fi
   install_frr_k8s $frr_port
 fi
