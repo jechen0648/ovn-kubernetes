@@ -2626,13 +2626,27 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 									},
 								)
 
-								ginkgo.By("Ensuring a request from the tested network pod cannot reach the other network pods")
+								outerSpec := networkSpecGen()
+								innerSpec := otherNetworkSpecGen()
+								bothEVPN := outerSpec != nil && outerSpec.Transport == udnv1.TransportOptionEVPN &&
+									innerSpec != nil && innerSpec.Transport == udnv1.TransportOptionEVPN
+								looseIsolationMode := os.Getenv("ADVERTISED_UDN_ISOLATION_MODE") == "loose" && bothEVPN
+								crossNetworkPodConnectivity := func(src *corev1.Pod, dstIP string) {
+									ginkgo.GinkgoHelper()
+									if looseIsolationMode {
+										testPodToClientIP(src, dstIP)
+									} else {
+										testPodToClientIPNOK(src, dstIP)
+									}
+								}
+
+								ginkgo.By("Verifying cross-network pod connectivity from the tested network pod to other network pods")
 								for _, target := range []*corev1.Pod{otherPodSameNode, otherPodDiffNode} {
 									testForIPFamilies(
 										ipFamilySet,
 										func(family utilnet.IPFamily) {
 											ginkgo.GinkgoHelper()
-											framework.Logf("Ensuring a request from the tested network pod cannot reach the other network pod %s on IPv%v", target.Name, family)
+											framework.Logf("Verifying cross-network pod connectivity from the tested network pod to %s on IPv%v (looseMode=%v)", target.Name, family, looseIsolationMode)
 											otherPodIP, err := getPodAnnotationIPsForPrimaryNetworkByIPFamily(
 												f.ClientSet,
 												target.Namespace,
@@ -2642,18 +2656,18 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 											)
 											gomega.Expect(err).NotTo(gomega.HaveOccurred())
 											gomega.Expect(otherPodIP).ToNot(gomega.BeEmpty())
-											testPodToClientIPNOK(testPod, otherPodIP)
+											crossNetworkPodConnectivity(testPod, otherPodIP)
 										},
 									)
 								}
 
-								ginkgo.By("Ensuring a request from the other network pods on the same node cannot reach the tested network pod")
+								ginkgo.By("Verifying cross-network pod connectivity from the other network pods to the tested network pod")
 								for _, source := range []*corev1.Pod{otherPodSameNode, otherPodDiffNode} {
 									testForIPFamilies(
 										ipFamilySet,
 										func(family utilnet.IPFamily) {
 											ginkgo.GinkgoHelper()
-											framework.Logf("Ensuring a request from the other network pod %s on the same node cannot reach the tested network pod on IPv%v", source.Name, family)
+											framework.Logf("Verifying cross-network pod connectivity from %s to the tested network pod on IPv%v (looseMode=%v)", source.Name, family, looseIsolationMode)
 											testPodIP, err := getPodAnnotationIPsForPrimaryNetworkByIPFamily(
 												f.ClientSet,
 												testPod.Namespace,
@@ -2663,7 +2677,7 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 											)
 											gomega.Expect(err).NotTo(gomega.HaveOccurred())
 											gomega.Expect(testPodIP).ToNot(gomega.BeEmpty())
-											testPodToClientIPNOK(source, testPodIP)
+											crossNetworkPodConnectivity(source, testPodIP)
 										},
 									)
 								}
@@ -2700,7 +2714,7 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 									)
 								}
 
-								ginkgo.By("Ensuring a request from the tested network pod cannot reach the other network services")
+								ginkgo.By("Ensuring a request from the tested network pod cannot reach the other network services (always isolated)")
 								for _, service := range services {
 									testForIPFamilies(
 										ipFamilySet,
