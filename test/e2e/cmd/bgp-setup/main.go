@@ -140,6 +140,7 @@ const (
 	PhaseDeployFRR        = "deploy-frr"        // Phase 1a: deploy FRR external container only
 	PhaseDeployBGPServer  = "deploy-bgp-server" // Phase 1b: deploy BGP server container only
 	PhaseInstallFRRK8s    = "install-frr-k8s"   // Phase 2: install frr-k8s and create FRRConfiguration for BGP peering
+	PhaseWaitFRRK8s       = "wait-frr-k8s"      // Wait for frr-k8s pods to be ready (used post-OVN for managed routing)
 )
 
 // frrK8sRemoteURL returns the raw GitHub URL for a file in the frr-k8s repo at a specific version
@@ -228,7 +229,7 @@ func main() {
 func parseFlags() *Config {
 	cfg := &Config{}
 
-	flag.StringVar(&cfg.Phase, "phase", PhaseAll, "Phase to run: 'all', 'deploy-containers' (FRR + BGP server), 'deploy-frr' (FRR only), 'deploy-bgp-server' (BGP server only), or 'install-frr-k8s' (frr-k8s + FRRConfiguration)")
+	flag.StringVar(&cfg.Phase, "phase", PhaseAll, "Phase to run: 'all', 'deploy-containers', 'deploy-frr', 'deploy-bgp-server', 'install-frr-k8s', or 'wait-frr-k8s'")
 	flag.StringVar(&cfg.ContainerRuntime, "container-runtime", getEnvOrDefault(envContainerRuntime, defaultContainerRuntime), "Container runtime to use (docker/podman)")
 	flag.BoolVar(&cfg.IPv4Enabled, "ipv4", getBoolEnvOrDefault(envIPv4Support, true), "Enable IPv4 support")
 	flag.BoolVar(&cfg.IPv6Enabled, "ipv6", getBoolEnvOrDefault(envIPv6Support, false), "Enable IPv6 support")
@@ -296,10 +297,11 @@ func run(cfg *Config) error {
 	runDeployFRR := cfg.Phase == PhaseAll || cfg.Phase == PhaseDeployContainers || cfg.Phase == PhaseDeployFRR
 	runDeployBGPServer := cfg.Phase == PhaseAll || cfg.Phase == PhaseDeployContainers || cfg.Phase == PhaseDeployBGPServer
 	runInstallFRRK8s := cfg.Phase == PhaseAll || cfg.Phase == PhaseInstallFRRK8s
+	runWaitFRRK8s := cfg.Phase == PhaseAll || cfg.Phase == PhaseInstallFRRK8s || cfg.Phase == PhaseWaitFRRK8s
 
-	if !runDeployFRR && !runDeployBGPServer && !runInstallFRRK8s {
-		return fmt.Errorf("invalid phase %q (expected: %s, %s, %s, %s, %s)",
-			cfg.Phase, PhaseAll, PhaseDeployContainers, PhaseDeployFRR, PhaseDeployBGPServer, PhaseInstallFRRK8s)
+	if !runDeployFRR && !runDeployBGPServer && !runInstallFRRK8s && !runWaitFRRK8s {
+		return fmt.Errorf("invalid phase %q (expected: %s, %s, %s, %s, %s, %s)",
+			cfg.Phase, PhaseAll, PhaseDeployContainers, PhaseDeployFRR, PhaseDeployBGPServer, PhaseInstallFRRK8s, PhaseWaitFRRK8s)
 	}
 	// Phase 1a: Deploy FRR external container
 	if runDeployFRR {
@@ -317,28 +319,37 @@ func run(cfg *Config) error {
 		}
 	}
 
-	// Phase 2: Install frr-k8s (install_frr_k8s + create FRRConfiguration)
+	// Phase 2: Install frr-k8s (apply manifest only; wait is deferred when
+	// --bgp-port is set because the CNI may not be ready pre-OVN)
 	if runInstallFRRK8s {
 		fmt.Println("\n====================== Installing frr-k8s ======================")
-		if err := installFRRK8s(cfg); err != nil {
+		skipWait := cfg.BGPPort != 0 && cfg.Phase == PhaseInstallFRRK8s
+		if err := installFRRK8s(cfg, skipWait); err != nil {
 			return fmt.Errorf("failed to install frr-k8s: %w", err)
 		}
+	}
 
-		// In managed routing mode (--bgp-port != 0), frr-k8s handles BGP
-		// internally so we skip FRRConfiguration and pod route setup.
-		if cfg.BGPPort == 0 {
-			// Create FRRConfiguration to establish BGP peering between cluster nodes and the external FRR router.
-			fmt.Println("\n====================== Creating FRRConfiguration for BGP peering ======================")
-			if err := createFRRConfiguration(cfg); err != nil {
-				return fmt.Errorf("failed to create FRRConfiguration: %w", err)
-			}
+	// Wait for frr-k8s pods (separate phase for managed routing, where
+	// install happens pre-OVN but pods only become ready post-OVN)
+	if cfg.Phase == PhaseWaitFRRK8s {
+		fmt.Println("\n====================== Waiting for frr-k8s ======================")
+		if err := waitForFRRK8sReady(); err != nil {
+			return fmt.Errorf("failed waiting for frr-k8s: %w", err)
+		}
+	}
 
-			// Add routes for pod networks if `--advertise-default-network=true`
-			if cfg.AdvertiseDefaultNetwork {
-				fmt.Println("\n====================== Adding routes for pod networks ======================")
-				if err := addPodNetworkRoutes(cfg, clientset); err != nil {
-					fmt.Printf("Warning: failed to add pod network routes: %v\n", err)
-				}
+	// Post frr-k8s install: create FRRConfiguration and add pod routes
+	// (skipped in managed routing mode where frr-k8s handles BGP internally)
+	if runInstallFRRK8s && cfg.BGPPort == 0 {
+		fmt.Println("\n====================== Creating FRRConfiguration for BGP peering ======================")
+		if err := createFRRConfiguration(cfg); err != nil {
+			return fmt.Errorf("failed to create FRRConfiguration: %w", err)
+		}
+
+		if cfg.AdvertiseDefaultNetwork {
+			fmt.Println("\n====================== Adding routes for pod networks ======================")
+			if err := addPodNetworkRoutes(cfg, clientset); err != nil {
+				fmt.Printf("Warning: failed to add pod network routes: %v\n", err)
 			}
 		}
 	}
@@ -943,7 +954,7 @@ func deployBGPExternalServer(cfg *Config, nodes []corev1.Node) error {
 	return nil
 }
 
-func installFRRK8s(cfg *Config) error {
+func installFRRK8s(cfg *Config, skipWait bool) error {
 	// Wait for API server to be ready
 	if err := waitForAPIServer(60 * time.Second); err != nil {
 		return fmt.Errorf("API server not ready: %w", err)
@@ -982,25 +993,33 @@ func installFRRK8s(cfg *Config) error {
 		return fmt.Errorf("failed to apply frr-k8s: %w", err)
 	}
 
-	// Wait for statuscleaner deployment
+	if skipWait {
+		fmt.Println("Skipping frr-k8s readiness wait (will be done post-OVN via wait-frr-k8s phase)")
+		return nil
+	}
+
+	return waitForFRRK8sReady()
+}
+
+// waitForFRRK8sReady waits for the frr-k8s statuscleaner deployment, daemon
+// daemonset, and webhook endpoint to become ready.
+func waitForFRRK8sReady() error {
 	fmt.Println("Waiting for frr-k8s statuscleaner deployment...")
 	if err := runKubectl("wait", "-n", frrK8sNS, "deployment", frrK8sDeploymentName, "--for", "condition=Available", "--timeout", deployTimeout); err != nil {
 		return fmt.Errorf("frr-k8s statuscleaner did not become ready: %w", err)
 	}
 
-	// Wait for daemon rollout
 	fmt.Println("Waiting for frr-k8s daemon rollout...")
 	if err := runKubectl("rollout", "status", "-n", frrK8sNS, "daemonset", frrK8sDaemonsetName, "--timeout", deployTimeout); err != nil {
 		return fmt.Errorf("frr-k8s daemon rollout failed: %w", err)
 	}
 
-	// Wait for frr-k8s webhook endpoint to be actually serving
 	fmt.Println("Probing frr-k8s webhook endpoint...")
 	if err := waitForFRRK8sWebhook(); err != nil {
 		fmt.Printf("Warning: webhook probe failed: %v\n", err)
 	}
 
-	fmt.Println("frr-k8s installed successfully")
+	fmt.Println("frr-k8s is ready")
 	return nil
 }
 

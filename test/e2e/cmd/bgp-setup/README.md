@@ -116,7 +116,7 @@ To remove all BGP infrastructure:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--phase` | `all` | Phase to run: `all`, `deploy-frr`, `deploy-bgp-server`, `deploy-containers`, or `install-frr-k8s` |
+| `--phase` | `all` | Phase to run: `all`, `deploy-frr`, `deploy-bgp-server`, `deploy-containers`, `install-frr-k8s`, or `wait-frr-k8s` |
 | `--container-runtime` | `docker` | Container runtime to use (docker/podman) |
 | `--ipv4` | `true` | Enable IPv4 support |
 | `--ipv6` | `false` | Enable IPv6 support |
@@ -142,7 +142,8 @@ The `--phase` flag allows running specific parts of the setup:
 - **`deploy-frr`**: Deploy FRR external container only
 - **`deploy-bgp-server`**: Deploy BGP server container only
 - **`deploy-containers`**: Deploy both FRR container and BGP server (combines deploy-frr + deploy-bgp-server)
-- **`install-frr-k8s`**: Install frr-k8s operator and create FRRConfiguration for BGP peering
+- **`install-frr-k8s`**: Install frr-k8s operator and create FRRConfiguration for BGP peering. When `--bgp-port` is set (managed routing), only applies the manifest and skips the readiness wait (use `wait-frr-k8s` post-OVN).
+- **`wait-frr-k8s`**: Wait for frr-k8s pods (statuscleaner deployment, daemon daemonset, webhook) to become ready. Used post-OVN for managed routing where the manifest is applied pre-OVN but pods need the CNI to start.
 
 #### Running All Phases (Standalone Usage)
 
@@ -169,6 +170,10 @@ When integrated with `kind.sh` or `kind-helm.sh`, phases are run separately beca
 
 # Phase 2: Install frr-k8s (after OVN is installed and cluster is ready)
 ./bgp-setup --phase install-frr-k8s
+
+# Managed routing: apply manifest pre-OVN, wait post-OVN
+./bgp-setup --phase install-frr-k8s --bgp-port 179   # pre-OVN (apply only)
+./bgp-setup --phase wait-frr-k8s                      # post-OVN (wait for pods)
 ```
 
 ## Environment Variables
@@ -200,7 +205,8 @@ The shell scripts call the tool in separate phases:
 # Before OVN installation:
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
   if [ "$ENABLE_NO_OVERLAY_MANAGED_ROUTING" == true ]; then
-    # Managed routing: install frr-k8s with bgpd on port 179 before OVN
+    # Managed routing: apply frr-k8s manifest with bgpd on port 179 (skip wait;
+    # pods can't start until the CNI is available)
     run_bgp_setup install-frr-k8s "--bgp-port=179"
   else
     # Phase 1a: Deploy external FRR container
@@ -214,7 +220,10 @@ fi
 
 # After OVN installation:
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
-  if [ "$ENABLE_NO_OVERLAY_MANAGED_ROUTING" != true ]; then
+  if [ "$ENABLE_NO_OVERLAY_MANAGED_ROUTING" == true ]; then
+    # Managed routing: now that OVN/CNI is ready, wait for frr-k8s pods
+    run_bgp_setup wait-frr-k8s
+  else
     # Phase 2: Install frr-k8s and create FRRConfiguration for BGP peering
     run_bgp_setup install-frr-k8s
   fi
