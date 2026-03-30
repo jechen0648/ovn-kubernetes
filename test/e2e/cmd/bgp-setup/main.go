@@ -177,6 +177,7 @@ type Config struct {
 	TestdataPath            string
 	ClusterName             string
 	BGPPort                 int
+	EnableEVPN              bool
 }
 
 func main() {
@@ -240,6 +241,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.Kubeconfig, "kubeconfig", getEnvOrDefault(envKubeconfig, filepath.Join(os.Getenv("HOME"), ".kube", "config")), "Path to kubeconfig file")
 	flag.StringVar(&cfg.ClusterName, "cluster-name", getEnvOrDefault(envClusterName, defaultClusterName), "Kind cluster name. Used to derive control-plane container name (${cluster-name}-control-plane)")
 	flag.IntVar(&cfg.BGPPort, "bgp-port", 0, "BGP port for frr-k8s daemon (0 = default/disabled, 179 = managed routing)")
+	flag.BoolVar(&cfg.EnableEVPN, "enable-evpn", false, "Enable EVPN (l2vpn evpn) configuration on external FRR container")
 	flag.BoolVar(&cfg.CleanupOnly, "cleanup", false, "Only cleanup existing BGP infrastructure")
 	flag.BoolVar(&cfg.UseDirectAPI, "use-direct-api", false, "Use direct API server address (control plane container IP) instead of kubeconfig server. Only works when Docker bridge network is routable from host.")
 	flag.StringVar(&cfg.TestdataPath, "testdata-path", getEnvOrDefault(envTestdataPath, ""), "Path to the testdata/routeadvertisements directory containing templates. Required when built with -trimpath.")
@@ -679,6 +681,23 @@ func deployFRRExternalContainer(cfg *Config, nodes []corev1.Node) error {
 		return fmt.Errorf("FRR daemons failed to become ready: %w", err)
 	}
 
+	if cfg.IPv6Enabled {
+		// Preserve IPv6 addresses during VRF enslavement. Without this, IPv6 global
+		// addresses are removed when interfaces are moved to a VRF, causing FRR/zebra
+		// to fail creating FIB nexthop groups.
+		// See: https://docs.kernel.org/networking/vrf.html
+		//      https://github.com/FRRouting/frr/issues/1666
+		if err := runCmd(runtime, "exec", frrContainerName, "sysctl", "-w", "net.ipv6.conf.all.keep_addr_on_down=1"); err != nil {
+			return fmt.Errorf("failed to set keep_addr_on_down sysctl: %w", err)
+		}
+	}
+
+	if cfg.EnableEVPN {
+		if err := configureEVPN(frrContainerName); err != nil {
+			return err
+		}
+	}
+
 	fmt.Println("FRR external container deployed successfully")
 	return nil
 }
@@ -758,6 +777,56 @@ func waitForFRRDaemons(containerName string) error {
 		// If we get any output (even "No BGP neighbors"), the daemons are operational
 		return len(strings.TrimSpace(out)) > 0, nil
 	})
+}
+
+// configureEVPN enables l2vpn evpn address-family on the external FRR container,
+// activates all BGP neighbors for EVPN, sets them as route-reflector-clients,
+// and enables advertise-all-vni. This must be called after the FRR container
+// is deployed and BGP neighbors are already configured.
+func configureEVPN(containerName string) error {
+	runtime := containerRuntime()
+
+	fmt.Println("Configuring global EVPN BGP on external FRR (advertise-all-vni + neighbor activation)...")
+
+	output, err := runCmdOutput(runtime, "exec", containerName, "vtysh", "-c", "show running-config")
+	if err != nil {
+		return fmt.Errorf("failed to get FRR running config: %w", err)
+	}
+
+	var neighbors []string
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "neighbor ") && strings.Contains(trimmed, "remote-as") {
+			parts := strings.Fields(trimmed)
+			if len(parts) >= 2 {
+				neighbors = append(neighbors, parts[1])
+			}
+		}
+	}
+
+	if len(neighbors) == 0 {
+		return fmt.Errorf("no BGP neighbors found in FRR running config for EVPN activation")
+	}
+
+	fmt.Printf("Activating EVPN for %d BGP neighbors: %v\n", len(neighbors), neighbors)
+
+	vtyshArgs := []string{"exec", containerName, "vtysh",
+		"-c", "configure terminal",
+		"-c", "router bgp 64512",
+		"-c", "address-family l2vpn evpn",
+	}
+	for _, neighbor := range neighbors {
+		vtyshArgs = append(vtyshArgs, "-c", fmt.Sprintf("neighbor %s activate", neighbor))
+		vtyshArgs = append(vtyshArgs, "-c", fmt.Sprintf("neighbor %s route-reflector-client", neighbor))
+	}
+	vtyshArgs = append(vtyshArgs, "-c", "advertise-all-vni", "-c", "exit-address-family", "-c", "end")
+
+	if err := runCmd(runtime, vtyshArgs...); err != nil {
+		return fmt.Errorf("failed to configure EVPN on FRR: %w", err)
+	}
+
+	fmt.Println("Global EVPN BGP config complete on external FRR")
+	return nil
 }
 
 func deployBGPExternalServer(cfg *Config, nodes []corev1.Node) error {

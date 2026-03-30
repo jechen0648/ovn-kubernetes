@@ -17,7 +17,7 @@ This tool reuses packages from the e2e test framework:
 
 The tool creates a multi-network topology with an external FRR router acting as a bridge
 between the KIND cluster and an isolated BGP server network. The FRR router container
-(using the `frr:10.4.1` image) connects to both the `kind` network (for BGP peering with
+(using the `frr:10.4.2` image) connects to both the `kind` network (for BGP peering with
 cluster nodes: ovn-control-plane, ovn-worker, ovn-worker2) and the `bgpnet` network. The
 `bgpserver` container (an agnhost instance) resides on the `bgpnet` network, simulating
 an external endpoint that is only reachable through the FRR router via BGP-advertised routes.
@@ -26,7 +26,7 @@ an external endpoint that is only reachable through the FRR router via BGP-adver
 -----------------               ------------------                         ---------------------
 |               | bgpnet        |                |       kind network      | ovn-control-plane |
 |   bgpserver   |<------------- |   FRR router   |<------ KIND cluster --  ---------------------
-|   (agnhost)   |               |  (frr:10.4.1)  |                         |    ovn-worker     |
+|   (agnhost)   |               |  (frr:10.4.2)  |                         |    ovn-worker     |
 -----------------               ------------------                         ---------------------
                                                                            |    ovn-worker2    |
                                                                            ---------------------
@@ -128,6 +128,8 @@ To remove all BGP infrastructure:
 | `--advertise-default-network` | `true` | Advertise the default network |
 | `--kubeconfig` | `~/.kube/config` | Path to kubeconfig file |
 | `--cluster-name` | `ovn` | Kind cluster name |
+| `--bgp-port` | `0` | BGP port for frr-k8s daemon (0 = default/disabled, 179 = managed routing) |
+| `--enable-evpn` | `false` | Enable EVPN (l2vpn evpn) configuration on external FRR container |
 | `--cleanup` | `false` | Only cleanup existing BGP infrastructure |
 | `--use-direct-api` | `false` | Use direct API server address (control plane container IP) instead of kubeconfig server. Only works when Docker bridge network is routable from host. |
 | `--testdata-path` | (auto-detected) | Path to `testdata/routeadvertisements` directory containing templates. Required when built with `-trimpath`. |
@@ -195,22 +197,27 @@ which is used by both `kind.sh` (standard deployment) and `kind-helm.sh` (Helm-b
 The shell scripts call the tool in separate phases:
 
 ```bash
-# Phase 1a: Before OVN installation - deploy FRR container
+# Before OVN installation:
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
-  run_bgp_setup deploy-frr
-fi
-
-# Phase 1b: Before OVN installation - deploy BGP server
-if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
-  run_bgp_setup deploy-bgp-server
+  if [ "$ENABLE_NO_OVERLAY_MANAGED_ROUTING" == true ]; then
+    # Managed routing: install frr-k8s with bgpd on port 179 before OVN
+    run_bgp_setup install-frr-k8s "--bgp-port=179"
+  else
+    # Phase 1a: Deploy external FRR container
+    run_bgp_setup deploy-frr
+    # Phase 1b: Deploy BGP server container
+    run_bgp_setup deploy-bgp-server
+  fi
 fi
 
 # ... OVN installation happens here ...
 
-# Phase 2: After OVN installation - install frr-k8s and create FRRConfiguration for BGP peering
-# Pod network routes are only added if ADVERTISE_DEFAULT_NETWORK=true
+# After OVN installation:
 if [ "$ENABLE_ROUTE_ADVERTISEMENTS" == true ]; then
-  run_bgp_setup install-frr-k8s
+  if [ "$ENABLE_NO_OVERLAY_MANAGED_ROUTING" != true ]; then
+    # Phase 2: Install frr-k8s and create FRRConfiguration for BGP peering
+    run_bgp_setup install-frr-k8s
+  fi
 fi
 ```
 
@@ -224,9 +231,10 @@ and passes the appropriate configuration flags.
 3. **Create bgpnet network** - Creates a separate network for the BGP server
 4. **Deploy bgpserver** - Creates an agnhost container acting as an external server
 5. **Configure routing** - Sets up routing between bgpserver, FRR router, and cluster nodes
-6. **Install frr-k8s** - Deploys the frr-k8s operator directly from GitHub
-7. **Apply FRRConfiguration** - Creates BGP peering configuration for the cluster when route advertisements are enabled
-8. **Add pod network routes** - Optionally adds routes for pod networks when `--advertise-default-network=true` (requires sudo)
+6. **Configure EVPN** - When `--enable-evpn` is set, enables l2vpn evpn address-family on the external FRR container with neighbor activation, route-reflector-client, and advertise-all-vni
+7. **Install frr-k8s** - Deploys the frr-k8s operator directly from GitHub (patches `gcr.io` image references to `registry.k8s.io`; optionally patches bgpd port for managed routing via `--bgp-port`)
+8. **Apply FRRConfiguration** - Creates BGP peering configuration for the cluster when route advertisements are enabled
+9. **Add pod network routes** - Optionally adds routes for pod networks when `--advertise-default-network=true` (requires sudo)
 
 ## Dependencies
 
