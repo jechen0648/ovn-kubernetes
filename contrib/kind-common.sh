@@ -1042,15 +1042,34 @@ deploy_frr_external_container() {
     # Neighbors are already configured by demo.sh; extract them from the running config.
     # This is cluster-level infrastructure shared across all EVPN tests; configured once
     # at install time so individual tests don't need to manage it.
-    local bgp_neighbors vtysh_cmds
-    bgp_neighbors=$($OCI_BIN exec frr vtysh -c "show running-config" | grep "^ neighbor.*remote-as" | awk '{print $2}')
+    local retries=0 bgp_neighbors vtysh_cmds
+    while true; do
+      bgp_neighbors=$($OCI_BIN exec frr vtysh -c "show running-config" 2>/dev/null | grep "^ neighbor.*remote-as" | awk '{print $2}' || true)
+      [ -n "$bgp_neighbors" ] && break
+      retries=$((retries + 1))
+      if [ "$retries" -ge 30 ]; then
+        echo "ERROR: FRR BGP neighbors not found in running-config after 30 seconds"
+        return 1
+      fi
+      sleep 1
+    done
     vtysh_cmds=(-c "configure terminal" -c "router bgp 64512" -c "address-family l2vpn evpn")
     for neighbor in $bgp_neighbors; do
       vtysh_cmds+=(-c "neighbor $neighbor activate")
       vtysh_cmds+=(-c "neighbor $neighbor route-reflector-client")
     done
-    vtysh_cmds+=(-c "advertise-all-vni" -c "exit-address-family" -c "end" -c "write memory")
+    vtysh_cmds+=(-c "advertise-all-vni" -c "exit-address-family" -c "end")
     $OCI_BIN exec frr vtysh "${vtysh_cmds[@]}"
+    # write memory requires all daemons (zebra) to be fully up; retry separately
+    retries=0
+    while ! $OCI_BIN exec frr vtysh -c "write memory" 2>/dev/null; do
+      retries=$((retries + 1))
+      if [ "$retries" -ge 30 ]; then
+        echo "WARNING: FRR write memory failed after 30 seconds, continuing anyway"
+        break
+      fi
+      sleep 1
+    done
     echo "Global EVPN BGP config complete on external FRR"
   fi
 }
