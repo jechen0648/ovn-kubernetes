@@ -2030,11 +2030,6 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 					ipVRFNetworkName,
 				),
 			).To(gomega.Succeed())
-			if externalASN != clusterASN {
-				ginkgo.By("Configuring allowas-in for eBGP EVPN inter-node route exchange")
-				err := configureEBGPEVPNAllowasIn(f, frrContainerName, ipFamilySet, clusterASN)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-			}
 			if networkSpec.EVPN.MACVRF != nil {
 				servers = append(servers, macVRFAgnhostName)
 			}

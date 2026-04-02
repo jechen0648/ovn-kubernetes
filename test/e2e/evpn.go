@@ -10,7 +10,6 @@ import (
 	"math/big"
 	"net"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -1182,6 +1181,24 @@ func createFRRConfiguration(ictx infraapi.Context,
 	// Generate FRRConfiguration YAML
 	// No toReceive needed - EVPN routes come via l2vpn evpn address-family
 	// and are imported via route-target matching in the VRF
+	isEBGP := localASN != neighborASN
+	rawConfigSection := ""
+	if isEBGP {
+		// For eBGP EVPN, inter-node routes transit through the external FRR peer and
+		// arrive with the local ASN in the AS_PATH, which BGP rejects as a loop.
+		// allowas-in must be configured via rawConfig because the FRRConfiguration CRD
+		// does not expose this field, and direct vtysh injection gets overwritten when
+		// frr-k8s reconciles.
+		rawConfigSection = fmt.Sprintf(`  raw:
+    priority: 10
+    rawConfig: |
+      router bgp %d
+       address-family l2vpn evpn
+        neighbor %s allowas-in
+       exit-address-family
+      !
+`, localASN, neighborIP)
+	}
 	yaml := fmt.Sprintf(`apiVersion: frrk8s.metallb.io/v1beta1
 kind: FRRConfiguration
 metadata:
@@ -1196,7 +1213,7 @@ metadata:
       - address: %s
         asn: %d
         disableMP: true
-`, name, namespace, labelsYAML, localASN, neighborIP, neighborASN)
+%s`, name, namespace, labelsYAML, localASN, neighborIP, neighborASN, rawConfigSection)
 
 	// Write to temp file
 	tmpFile, err := os.CreateTemp("", "frrconfig-*.yaml")
@@ -1229,64 +1246,6 @@ metadata:
 	})
 
 	framework.Logf("FRRConfiguration created: %s (neighbor: %s)", name, neighborIP)
-	return nil
-}
-
-// configureEBGPEVPNAllowasIn adds "allowas-in" for the l2vpn evpn neighbor on
-// each cluster node's frr-k8s. This is required for eBGP EVPN because without
-// it, inter-node EVPN routes are rejected: when Node A (AS 64512) sends a route
-// through the external FRR (AS 64513) to Node B (AS 64512), Node B sees its own
-// AS in the AS_PATH and drops the route (BGP loop prevention). allowas-in
-// disables this check so routes can transit through the external eBGP peer.
-func configureEBGPEVPNAllowasIn(
-	f *framework.Framework,
-	frrContainerName string,
-	ipFamilySet sets.Set[utilnet.IPFamily],
-	clusterASN int,
-) error {
-	externalFRRIP, err := getExternalFRRIP(frrContainerName, ipFamilySet)
-	if err != nil {
-		return err
-	}
-
-	nodeList, err := f.ClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to list nodes: %w", err)
-	}
-
-	frrNamespace := deploymentconfig.Get().FRRK8sNamespace()
-
-	for _, node := range nodeList.Items {
-		frrPods, err := f.ClientSet.CoreV1().Pods(frrNamespace).List(
-			context.Background(),
-			metav1.ListOptions{
-				LabelSelector: "app=frr-k8s",
-				FieldSelector: "spec.nodeName=" + node.Name,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("failed to list frr-k8s pods on node %s: %w", node.Name, err)
-		}
-		if len(frrPods.Items) == 0 {
-			return fmt.Errorf("no frr-k8s pod found on node %s", node.Name)
-		}
-
-		frrPodName := frrPods.Items[0].Name
-		cmd := exec.Command("kubectl", "exec", "-n", frrNamespace, frrPodName, "-c", "frr", "--",
-			"vtysh",
-			"-c", "configure terminal",
-			"-c", fmt.Sprintf("router bgp %d", clusterASN),
-			"-c", "address-family l2vpn evpn",
-			"-c", fmt.Sprintf("neighbor %s allowas-in", externalFRRIP),
-			"-c", "end",
-		)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("failed to configure allowas-in on node %s: %w\nOutput: %s", node.Name, err, output)
-		}
-		framework.Logf("[%s] Configured l2vpn evpn allowas-in for eBGP neighbor %s", node.Name, externalFRRIP)
-	}
-
 	return nil
 }
 
