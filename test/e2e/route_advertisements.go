@@ -2035,6 +2035,15 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 		timeoutNOK = 5 * time.Second        // 4-6 attempts
 		pollingNOK = 100 * time.Millisecond // poll immediately
 
+		// Used for cross-network connectivity checks after route leaking is
+		// already configured for EVPN loose mode. The BGP topology is
+		// already up at that point; we only need to wait for EVPN route
+		// propagation. On a local KIND cluster the full chain (FRR RT-import
+		// policy change → kernel VRF table update → advertise ipv4 unicast
+		// re-originates type-5 UPDATEs → FRR-K8s processes → OVN-K programs
+		// flows) can take up to ~60 s.
+		timeoutRouteLeaking = 60 * time.Second
+
 		// 1s, minimum
 		curlMaxTime    = 1
 		curlMaxTimeStr = "1"
@@ -2235,6 +2244,7 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 		func(testedNetworkType networkType, networkSpecGen func() *udnv1.NetworkSpec) {
 			var testNamespace *corev1.Namespace
 			var testPod *corev1.Pod
+			var capturedNetworkSpec *udnv1.NetworkSpec
 
 			getSameNode := func() string {
 				return testPod.Spec.NodeName
@@ -2260,6 +2270,7 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 				case networkSpec.Layer2 != nil:
 					networkSpec.Layer2.Subnets = matchL2SubnetsByIPFamilies(ipFamilySet, networkSpec.Layer2.Subnets...)
 				}
+				capturedNetworkSpec = networkSpec
 
 				testNamespace, externalServers = configureNetworkWithInfra(
 					f,
@@ -2543,6 +2554,7 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 						func(networkType networkType, otherNetworkSpecGen func() *udnv1.NetworkSpec) {
 							var otherNamespace *corev1.Namespace
 							var otherNetworkName string
+							var capturedOtherNetworkSpec *udnv1.NetworkSpec
 
 							ginkgo.BeforeEach(func() {
 								otherNetworkName = testBaseName + "o"
@@ -2557,6 +2569,7 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 								case otherNetworkSpec.Layer2 != nil:
 									otherNetworkSpec.Layer2.Subnets = matchL2SubnetsByIPFamilies(ipFamilySet, otherNetworkSpec.Layer2.Subnets...)
 								}
+								capturedOtherNetworkSpec = otherNetworkSpec
 
 								otherNamespace, _ = configureNetworkWithInfra(
 									f,
@@ -2569,7 +2582,26 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 								)
 							})
 
-							ginkgo.It("Both networks are isolated", func() {
+					// Probe the spec generators at tree-building time to determine the It
+					// description. We only inspect structural properties (transport type,
+					// IP-VRF presence); the actual specs used by the test are generated
+					// freshly in BeforeEach via capturedNetworkSpec/capturedOtherNetworkSpec.
+					// Only pure IP-VRF networks (no MAC-VRF) support inter-VRF route leaking;
+					// networks with a MAC-VRF component are excluded even if they also have an IP-VRF.
+					probeIsIPVRFOnly := func(spec *udnv1.NetworkSpec) bool {
+						return spec != nil && spec.EVPN != nil && spec.EVPN.IPVRF != nil && spec.EVPN.MACVRF == nil
+					}
+					outerProbe := networkSpecGen()
+					innerProbe := otherNetworkSpecGen()
+					probeBothEVPN := outerProbe != nil && outerProbe.Transport == udnv1.TransportOptionEVPN &&
+						innerProbe != nil && innerProbe.Transport == udnv1.TransportOptionEVPN
+					isolationItDesc := "Both networks are isolated in strict mode"
+					if os.Getenv("ADVERTISED_UDN_ISOLATION_MODE") == "loose" && probeBothEVPN &&
+						probeIsIPVRFOnly(outerProbe) && probeIsIPVRFOnly(innerProbe) {
+						isolationItDesc = "Both networks communication is allowed in loose mode"
+					}
+
+					ginkgo.It(isolationItDesc, func() {
 								ginkgo.By("Running two pods on the other network namespace on different nodes")
 								var otherPodSameNode, otherPodDiffNode *corev1.Pod
 								wg := sync.WaitGroup{}
@@ -2626,15 +2658,34 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 									},
 								)
 
-								outerSpec := networkSpecGen()
-								innerSpec := otherNetworkSpecGen()
+								outerSpec := capturedNetworkSpec
+								innerSpec := capturedOtherNetworkSpec
 								bothEVPN := outerSpec != nil && outerSpec.Transport == udnv1.TransportOptionEVPN &&
 									innerSpec != nil && innerSpec.Transport == udnv1.TransportOptionEVPN
-								looseIsolationMode := os.Getenv("ADVERTISED_UDN_ISOLATION_MODE") == "loose" && bothEVPN
+								isIPVRFOnly := func(spec *udnv1.NetworkSpec) bool {
+									return spec != nil && spec.EVPN != nil && spec.EVPN.IPVRF != nil && spec.EVPN.MACVRF == nil
+								}
+								// Loose mode cross-network connectivity requires inter-VRF route leaking.
+								// Only pure IP-VRF networks (no MAC-VRF) support this: networks with a
+								// MAC-VRF component do not have a Linux VRF on the external FRR that can
+								// participate in RT-based route leaking, even if they also have an IP-VRF.
+								looseIsolationMode := os.Getenv("ADVERTISED_UDN_ISOLATION_MODE") == "loose" && bothEVPN &&
+									isIPVRFOnly(outerSpec) && isIPVRFOnly(innerSpec)
+								if looseIsolationMode {
+									ginkgo.By("Configuring loose EVPN inter-VRF route leaking on external FRR")
+									gomega.Expect(addLooseEVPNInterVRFRouting(ictx, bgpASN, outerSpec, innerSpec)).To(gomega.Succeed())
+								}
 								crossNetworkPodConnectivity := func(src *corev1.Pod, dstIP string) {
 									ginkgo.GinkgoHelper()
 									if looseIsolationMode {
-										testPodToClientIP(src, dstIP)
+										gomega.Eventually(func(g gomega.Gomega) {
+											_, err := e2epodoutput.RunHostCmd(
+												src.Namespace,
+												src.Name,
+												fmt.Sprintf("curl --max-time %d -g -q -s http://%s/clientip", curlMaxTime, net.JoinHostPort(dstIP, netexecPortStr)),
+											)
+											g.Expect(err).NotTo(gomega.HaveOccurred())
+										}).WithTimeout(timeoutRouteLeaking).WithPolling(polling).Should(gomega.Succeed())
 									} else {
 										testPodToClientIPNOK(src, dstIP)
 									}
@@ -2714,7 +2765,7 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 									)
 								}
 
-								ginkgo.By("Ensuring a request from the tested network pod cannot reach the other network services (always isolated)")
+								ginkgo.By("Ensuring a request from the tested network pod cannot reach the other network services (service ClusterIP access is always isolated regardless of pod connectivity mode)")
 								for _, service := range services {
 									testForIPFamilies(
 										ipFamilySet,
