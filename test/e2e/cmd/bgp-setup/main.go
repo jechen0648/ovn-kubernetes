@@ -775,18 +775,25 @@ func waitForContainer(name string) error {
 }
 
 // waitForFRRDaemons waits for FRR daemons (zebra and bgpd) to be fully operational
-// by checking if vtysh can successfully query the running configuration.
+// AND for frr.conf to be fully loaded (BGP neighbors appear in bgp summary).
+// This is important because vtysh uses CombinedOutput and may return non-empty output
+// (e.g. "% Can't open vtysh.conf") before bgpd has loaded its frr.conf config.
+// Waiting for "Neighbor" in the BGP summary ensures frr.conf is fully processed
+// before we attempt to apply EVPN configuration on top of it.
 func waitForFRRDaemons(containerName string) error {
 	runtime := containerRuntime()
 	return wait.PollUntilContextTimeout(context.Background(), pollInterval, containerTimeout, true, func(ctx context.Context) (bool, error) {
-		// Check if vtysh can connect and query BGP - this confirms both zebra and bgpd are running
+		// Check if vtysh can connect and bgpd has loaded its frr.conf config.
+		// We look for "Neighbor" in the BGP summary which appears once bgpd has
+		// loaded its configuration and registered BGP peers from frr.conf.
+		// This avoids a false-positive from vtysh warnings (e.g. missing vtysh.conf)
+		// that would appear in CombinedOutput before bgpd is ready.
 		out, err := runCmdOutput(runtime, "exec", containerName, "vtysh", "-c", "show bgp summary")
 		if err != nil {
 			// Daemon not ready yet
 			return false, nil
 		}
-		// If we get any output (even "No BGP neighbors"), the daemons are operational
-		return len(strings.TrimSpace(out)) > 0, nil
+		return strings.Contains(out, "Neighbor"), nil
 	})
 }
 
@@ -830,7 +837,11 @@ func configureEVPN(containerName string) error {
 		vtyshArgs = append(vtyshArgs, "-c", fmt.Sprintf("neighbor %s activate", neighbor))
 		vtyshArgs = append(vtyshArgs, "-c", fmt.Sprintf("neighbor %s route-reflector-client", neighbor))
 	}
-	vtyshArgs = append(vtyshArgs, "-c", "advertise-all-vni", "-c", "exit-address-family", "-c", "end")
+	// "write memory" persists the EVPN config to frr.conf so it survives any
+	// frr.conf reload race and potential FRR restarts. This matches the behavior
+	// of the original bash deploy_frr_external_container() which also ran
+	// "write memory" after configuring EVPN.
+	vtyshArgs = append(vtyshArgs, "-c", "advertise-all-vni", "-c", "exit-address-family", "-c", "end", "-c", "write memory")
 
 	if err := runCmd(runtime, vtyshArgs...); err != nil {
 		return fmt.Errorf("failed to configure EVPN on FRR: %w", err)
