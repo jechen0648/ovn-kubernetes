@@ -2662,15 +2662,8 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 								innerSpec := capturedOtherNetworkSpec
 								bothEVPN := outerSpec != nil && outerSpec.Transport == udnv1.TransportOptionEVPN &&
 									innerSpec != nil && innerSpec.Transport == udnv1.TransportOptionEVPN
-								isIPVRFOnly := func(spec *udnv1.NetworkSpec) bool {
-									return spec != nil && spec.EVPN != nil && spec.EVPN.IPVRF != nil && spec.EVPN.MACVRF == nil
-								}
-								// Loose mode cross-network connectivity requires inter-VRF route leaking.
-								// Only pure IP-VRF networks (no MAC-VRF) support this: networks with a
-								// MAC-VRF component do not have a Linux VRF on the external FRR that can
-								// participate in RT-based route leaking, even if they also have an IP-VRF.
 								looseIsolationMode := os.Getenv("ADVERTISED_UDN_ISOLATION_MODE") == "loose" && bothEVPN &&
-									isIPVRFOnly(outerSpec) && isIPVRFOnly(innerSpec)
+									isEVPNIPVRFOnly(outerSpec) && isEVPNIPVRFOnly(innerSpec)
 								if looseIsolationMode {
 									ginkgo.By("Configuring loose EVPN inter-VRF route leaking on external FRR")
 									gomega.Expect(addLooseEVPNInterVRFRouting(ictx, bgpASN, outerSpec, innerSpec)).To(gomega.Succeed())

@@ -91,6 +91,14 @@ const (
 	agnhostHTTPPort = 8080
 )
 
+// isEVPNIPVRFOnly reports whether the given network spec is a pure IP-VRF
+// EVPN network (has an IP-VRF but no MAC-VRF). Networks with a MAC-VRF
+// component do not have a Linux VRF on the external FRR that can participate
+// in VRF route leaking, even if they also have an IP-VRF.
+func isEVPNIPVRFOnly(spec *udnv1.NetworkSpec) bool {
+	return spec != nil && spec.EVPN != nil && spec.EVPN.IPVRF != nil && spec.EVPN.MACVRF == nil
+}
+
 // setupEVPNBridgeOnExternalFRR creates a Linux bridge and VXLAN device on the external FRR
 // container. This is the foundation for both MAC-VRF and IP-VRF tests.
 //
@@ -496,12 +504,9 @@ func setupIPVRFBGPOnExternalFRR(ictx infraapi.Context, vrfName string, asn, vni 
 //
 // Cleanup (removal of the cross-RT imports) is registered via ictx.AddCleanUpFn().
 func addLooseEVPNInterVRFRouting(ictx infraapi.Context, asn int, specA, specB *udnv1.NetworkSpec) error {
-	isIPVRFOnly := func(spec *udnv1.NetworkSpec) bool {
-		return spec != nil && spec.EVPN != nil && spec.EVPN.IPVRF != nil && spec.EVPN.MACVRF == nil
-	}
-	if !isIPVRFOnly(specA) || !isIPVRFOnly(specB) {
+	if !isEVPNIPVRFOnly(specA) || !isEVPNIPVRFOnly(specB) {
 		framework.Logf("Skipping loose EVPN inter-VRF routing: one or both networks are not pure IP-VRF (specA isIPVRFOnly=%v, specB isIPVRFOnly=%v)",
-			isIPVRFOnly(specA), isIPVRFOnly(specB))
+			isEVPNIPVRFOnly(specA), isEVPNIPVRFOnly(specB))
 		return nil
 	}
 
@@ -512,17 +517,22 @@ func addLooseEVPNInterVRFRouting(ictx infraapi.Context, asn int, specA, specB *u
 
 	frr := infraapi.ExternalContainer{Name: externalFRRContainerName}
 
-	// Use FRR's VRF route leaking (import vrf) in the IPv4 unicast address-family
+	// Use FRR's VRF route leaking (import vrf) in the unicast address-families
 	// instead of route-target import in l2vpn evpn.  The key difference is that
 	// "import vrf" brings pod CIDRs from the other VRF's routing table as regular
-	// IPv4 unicast routes (not as EVPN-derived entries), which sidesteps FRR's
+	// unicast routes (not as EVPN-derived entries), which sidesteps FRR's
 	// loop-prevention logic that would otherwise suppress re-advertisement of
-	// EVPN-learned routes.  Combined with "advertise ipv4 unicast" per VRF,
-	// FRR re-originates those imported routes as fresh type-5 EVPN UPDATEs
-	// (VTEP = FRR's own IP) and sends them to the cluster nodes.  Cluster nodes
-	// then install the cross-VRF pod CIDRs into their VRF routing tables via
-	// FRR-K8s, and OVN-K programs the necessary flows so cross-UDN pods can
-	// reach each other (hairpinning through FRR in the data plane).
+	// EVPN-learned routes.  Combined with the "advertise ipv4/ipv6 unicast"
+	// already configured by setupIPVRFBGPOnExternalFRR, FRR re-originates those
+	// imported routes as fresh type-5 EVPN UPDATEs (VTEP = FRR's own IP) and
+	// sends them to the cluster nodes.  Cluster nodes then install the cross-VRF
+	// pod CIDRs into their VRF routing tables via FRR-K8s, and OVN-K programs
+	// the necessary flows so cross-UDN pods can reach each other (hairpinning
+	// through FRR in the data plane).
+	//
+	// NOTE: This helper only manages "import vrf" / "no import vrf" commands.
+	// The l2vpn evpn advertise directives are owned by setupIPVRFBGPOnExternalFRR
+	// and must not be touched here.
 	args := []string{
 		"configure terminal",
 		fmt.Sprintf("router bgp %d vrf %s", asn, vrfNameA),
@@ -532,10 +542,6 @@ func addLooseEVPNInterVRFRouting(ictx infraapi.Context, asn int, specA, specB *u
 		"address-family ipv6 unicast",
 		fmt.Sprintf("import vrf %s", vrfNameB),
 		"exit-address-family",
-		"address-family l2vpn evpn",
-		"advertise ipv4 unicast",
-		"advertise ipv6 unicast",
-		"exit-address-family",
 		fmt.Sprintf("router bgp %d vrf %s", asn, vrfNameB),
 		"address-family ipv4 unicast",
 		fmt.Sprintf("import vrf %s", vrfNameA),
@@ -543,13 +549,32 @@ func addLooseEVPNInterVRFRouting(ictx infraapi.Context, asn int, specA, specB *u
 		"address-family ipv6 unicast",
 		fmt.Sprintf("import vrf %s", vrfNameA),
 		"exit-address-family",
-		"address-family l2vpn evpn",
-		"advertise ipv4 unicast",
-		"advertise ipv6 unicast",
-		"exit-address-family",
 		"end",
 	}
 	if _, err := infraprovider.Get().ExecExternalContainerCommand(frr, vtyshCommand(args...)); err != nil {
+		// Best-effort rollback: vtysh may have partially applied import vrf
+		// commands before failing on a later one, so attempt to undo them.
+		rollbackArgs := []string{
+			"configure terminal",
+			fmt.Sprintf("router bgp %d vrf %s", asn, vrfNameA),
+			"address-family ipv4 unicast",
+			fmt.Sprintf("no import vrf %s", vrfNameB),
+			"exit-address-family",
+			"address-family ipv6 unicast",
+			fmt.Sprintf("no import vrf %s", vrfNameB),
+			"exit-address-family",
+			fmt.Sprintf("router bgp %d vrf %s", asn, vrfNameB),
+			"address-family ipv4 unicast",
+			fmt.Sprintf("no import vrf %s", vrfNameA),
+			"exit-address-family",
+			"address-family ipv6 unicast",
+			fmt.Sprintf("no import vrf %s", vrfNameA),
+			"exit-address-family",
+			"end",
+		}
+		if _, rbErr := infraprovider.Get().ExecExternalContainerCommand(frr, vtyshCommand(rollbackArgs...)); rbErr != nil {
+			framework.Logf("Warning: best-effort rollback of import vrf also failed (VRF %s <-> VRF %s): %v", vrfNameA, vrfNameB, rbErr)
+		}
 		return fmt.Errorf("failed to configure loose EVPN inter-VRF routing (VRF %s <-> VRF %s): %w", vrfNameA, vrfNameB, err)
 	}
 
@@ -576,20 +601,12 @@ func addLooseEVPNInterVRFRouting(ictx infraapi.Context, asn int, specA, specB *u
 			"address-family ipv6 unicast",
 			fmt.Sprintf("no import vrf %s", vrfNameB),
 			"exit-address-family",
-			"address-family l2vpn evpn",
-			"no advertise ipv4 unicast",
-			"no advertise ipv6 unicast",
-			"exit-address-family",
 			fmt.Sprintf("router bgp %d vrf %s", asn, vrfNameB),
 			"address-family ipv4 unicast",
 			fmt.Sprintf("no import vrf %s", vrfNameA),
 			"exit-address-family",
 			"address-family ipv6 unicast",
 			fmt.Sprintf("no import vrf %s", vrfNameA),
-			"exit-address-family",
-			"address-family l2vpn evpn",
-			"no advertise ipv4 unicast",
-			"no advertise ipv6 unicast",
 			"exit-address-family",
 			"end",
 		}
