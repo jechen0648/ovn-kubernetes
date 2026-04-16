@@ -489,20 +489,26 @@ func setupIPVRFBGPOnExternalFRR(ictx infraapi.Context, vrfName string, asn, vni 
 	return nil
 }
 
-// addLooseEVPNInterVRFRouting configures bidirectional BGP route-target imports between
-// two EVPN networks on the external FRR container to enable cross-network pod connectivity
-// in loose isolation mode.
+// addLooseEVPNInterVRFRouting configures bidirectional VRF route leaking between
+// two IP-VRF networks on the external FRR container to enable cross-network pod
+// connectivity in loose isolation mode.
 //
-// For each network with an IP-VRF, this adds the other network's route-target as an
-// additional import in the l2vpn evpn address-family. This causes FRR to install
-// EVPN type-5 prefix routes from one VRF into the other, which are then re-advertised
-// to the cluster nodes via EVPN BGP. FRR-K8s on each node picks up the leaked routes
-// and programs them into OVN-K, enabling cross-network pod IP reachability.
+// For each IP-VRF network, "import vrf <peerVRF>" is added to both the ipv4 unicast
+// and ipv6 unicast address-families. This imports pod CIDRs from the peer VRF as
+// regular unicast routes (not EVPN-derived), bypassing FRR's loop-prevention logic
+// that would otherwise suppress re-advertisement of EVPN-learned routes. Combined
+// with the "advertise ipv4/ipv6 unicast" directives in address-family l2vpn evpn
+// already owned by setupIPVRFBGPOnExternalFRR, FRR re-originates those imported
+// routes as fresh type-5 EVPN UPDATEs (VTEP = FRR's own IP). Cluster nodes receive
+// them via FRR-K8s and OVN-K programs the necessary flows so cross-UDN pods can
+// reach each other (hairpinning through FRR in the data plane).
 //
-// Networks with only a MAC-VRF (no IP-VRF) do not have a Linux VRF on the external FRR
-// and cannot participate in RT-based route leaking; those cases are skipped with a log.
+// Networks with only a MAC-VRF (no IP-VRF) do not create a Linux VRF on the
+// external FRR and cannot participate in VRF route leaking; those pairs are skipped.
 //
-// Cleanup (removal of the cross-RT imports) is registered via ictx.AddCleanUpFn().
+// This helper only manages "import vrf" / "no import vrf" commands. The l2vpn evpn
+// advertise directives are owned by setupIPVRFBGPOnExternalFRR and are not touched here.
+// Cleanup is registered via ictx.AddCleanUpFn().
 func addLooseEVPNInterVRFRouting(ictx infraapi.Context, asn int, specA, specB *udnv1.NetworkSpec) error {
 	if !isEVPNIPVRFOnly(specA) || !isEVPNIPVRFOnly(specB) {
 		framework.Logf("Skipping loose EVPN inter-VRF routing: one or both networks are not pure IP-VRF (specA isIPVRFOnly=%v, specB isIPVRFOnly=%v)",
