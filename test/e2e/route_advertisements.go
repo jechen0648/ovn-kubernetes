@@ -1985,6 +1985,7 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 					macVRFNetworkName,
 					ipVRFAgnhostName,
 					ipVRFNetworkName,
+					nil,
 				),
 			).To(gomega.Succeed())
 			if networkSpec.EVPN.MACVRF != nil {
@@ -2721,6 +2722,274 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 			})
 		},
 		networksToTest,
+	)
+
+	// =========================================================================
+	// Overlapping EVPN CUDNs isolation tests
+	// =========================================================================
+	// These tests verify that two EVPN-enabled CUDNs sharing the same subnet
+	// but using different VNIs are properly isolated. Both networks share a
+	// single bridge/VXLAN/VTEP on the external FRR. Each entry creates two
+	// networks (A and B) with identical subnets, sets up per-network external
+	// servers, creates a pod on each, and validates:
+	//   1. Each pod can reach its own VPN's external servers (north-south)
+	//   2. Each pod cannot reach the other VPN's servers (cross-VPN isolation)
+	//   3. Pods on different CUDNs cannot reach each other (east-west isolation)
+
+	overlappingL3IPVRFSpecGen := func(subnets []string) *udnv1.NetworkSpec {
+		l3Subnets := make([]udnv1.Layer3Subnet, 0, len(subnets))
+		for _, s := range subnets {
+			l3Subnets = append(l3Subnets, udnv1.Layer3Subnet{CIDR: udnv1.CIDR(s)})
+		}
+		return &udnv1.NetworkSpec{
+			Topology:  udnv1.NetworkTopologyLayer3,
+			Layer3:    &udnv1.Layer3Config{Role: udnv1.NetworkRolePrimary, Subnets: l3Subnets},
+			Transport: udnv1.TransportOptionEVPN,
+			EVPN:      &udnv1.EVPNConfig{IPVRF: &udnv1.VRFConfig{VNI: randomVNI()}},
+		}
+	}
+	overlappingL2MACVRFSpecGen := func(subnets []string) *udnv1.NetworkSpec {
+		dualStack := make(udnv1.DualStackCIDRs, 0, len(subnets))
+		for _, s := range subnets {
+			dualStack = append(dualStack, udnv1.CIDR(s))
+		}
+		return &udnv1.NetworkSpec{
+			Topology:  udnv1.NetworkTopologyLayer2,
+			Layer2:    &udnv1.Layer2Config{Role: udnv1.NetworkRolePrimary, Subnets: dualStack},
+			Transport: udnv1.TransportOptionEVPN,
+			EVPN:      &udnv1.EVPNConfig{MACVRF: &udnv1.VRFConfig{VNI: randomVNI()}},
+		}
+	}
+	overlappingL2MACVRFIPVRFSpecGen := func(subnets []string) *udnv1.NetworkSpec {
+		dualStack := make(udnv1.DualStackCIDRs, 0, len(subnets))
+		for _, s := range subnets {
+			dualStack = append(dualStack, udnv1.CIDR(s))
+		}
+		return &udnv1.NetworkSpec{
+			Topology:  udnv1.NetworkTopologyLayer2,
+			Layer2:    &udnv1.Layer2Config{Role: udnv1.NetworkRolePrimary, Subnets: dualStack},
+			Transport: udnv1.TransportOptionEVPN,
+			EVPN: &udnv1.EVPNConfig{
+				MACVRF: &udnv1.VRFConfig{VNI: randomVNI()},
+				IPVRF:  &udnv1.VRFConfig{VNI: randomVNI()},
+			},
+		}
+	}
+
+	ginkgo.DescribeTable("Overlapping EVPN CUDNs are isolated from each other",
+		func(specGen func([]string) *udnv1.NetworkSpec) {
+			cudnIPv4, cudnIPv6 := randomCUDNSubnets()
+			sharedSubnets := []string{cudnIPv4, cudnIPv6}
+
+			specA := specGen(sharedSubnets)
+			specB := specGen(sharedSubnets)
+
+			hasMACVRF := specA.EVPN != nil && specA.EVPN.MACVRF != nil
+
+			switch {
+			case specA.Layer3 != nil:
+				specA.Layer3.Subnets = matchL3SubnetsByIPFamilies(ipFamilySet, specA.Layer3.Subnets...)
+				specB.Layer3.Subnets = matchL3SubnetsByIPFamilies(ipFamilySet, specB.Layer3.Subnets...)
+			case specA.Layer2 != nil:
+				specA.Layer2.Subnets = matchL2SubnetsByIPFamilies(ipFamilySet, specA.Layer2.Subnets...)
+				specB.Layer2.Subnets = matchL2SubnetsByIPFamilies(ipFamilySet, specB.Layer2.Subnets...)
+			}
+
+			networkNameA := testBaseName + "a"
+			networkNameB := testBaseName + "b"
+
+			kindNetwork, err := infraprovider.Get().PrimaryNetwork()
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			kindV4Subnet, _, err := kindNetwork.IPv4IPv6Subnets()
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			vtepSubnets := []string{kindV4Subnet}
+
+			ginkgo.By("Setting up shared EVPN infrastructure on external FRR")
+			shared, err := setupSharedEVPNInfra(f, ictx, testBaseName, ipFamilySet, vtepSubnets, bgpASN, hasMACVRF)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			type netInfo struct {
+				name, macVRFAgnhost, ipVRFAgnhost string
+				spec                              *udnv1.NetworkSpec
+				servers                           []string
+			}
+			nets := []netInfo{
+				{name: networkNameA, spec: specA},
+				{name: networkNameB, spec: specB},
+			}
+			for i := range nets {
+				n := &nets[i]
+				n.macVRFAgnhost = n.name + "-macvrf-agnhost"
+				n.ipVRFAgnhost = n.name + "-ipvrf-agnhost"
+				ipVRFv4, ipVRFv6 := randomIPVRFAgnhostSubnets()
+
+				shared.reassignIPs = i > 0 && hasMACVRF
+
+				gomega.Expect(
+					runEVPNNetworkAndServers(
+						f, ictx, n.name, ipFamilySet, n.spec,
+						[]string{ipVRFv4, ipVRFv6}, vtepSubnets, bgpASN,
+						n.macVRFAgnhost, n.macVRFAgnhost,
+						n.ipVRFAgnhost, n.ipVRFAgnhost,
+						shared,
+					),
+				).To(gomega.Succeed())
+
+				if n.spec.EVPN.MACVRF != nil {
+					n.servers = append(n.servers, n.macVRFAgnhost)
+				}
+				if n.spec.EVPN.IPVRF != nil {
+					n.servers = append(n.servers, n.ipVRFAgnhost)
+				}
+			}
+
+			ginkgo.By("Creating namespaces and CUDNs for both networks")
+			var nsA, nsB *corev1.Namespace
+			var nsErrA, nsErrB error
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer ginkgo.GinkgoRecover()
+				defer wg.Done()
+				nsA, nsErrA = createNamespaceWithPrimaryNetworkOfType(f, ictx, testBaseName, networkNameA, cudnAdvertisedEVPN, specA)
+			}()
+			go func() {
+				defer ginkgo.GinkgoRecover()
+				defer wg.Done()
+				nsB, nsErrB = createNamespaceWithPrimaryNetworkOfType(f, ictx, testBaseName, networkNameB, cudnAdvertisedEVPN, specB)
+			}()
+			wg.Wait()
+			gomega.Expect(nsErrA).NotTo(gomega.HaveOccurred())
+			gomega.Expect(nsErrB).NotTo(gomega.HaveOccurred())
+
+			ginkgo.By("Creating pods on each overlapping network")
+			var podA, podB *corev1.Pod
+			wg.Add(2)
+			go func() {
+				defer ginkgo.GinkgoRecover()
+				defer wg.Done()
+				podA = e2epod.CreateExecPodOrFail(
+					context.Background(), f.ClientSet, nsA.Name,
+					nsA.Name+"-netexec-pod",
+					func(p *corev1.Pod) { p.Spec.Containers[0].Args = []string{"netexec"} },
+				)
+			}()
+			go func() {
+				defer ginkgo.GinkgoRecover()
+				defer wg.Done()
+				podB = e2epod.CreateExecPodOrFail(
+					context.Background(), f.ClientSet, nsB.Name,
+					nsB.Name+"-netexec-pod",
+					func(p *corev1.Pod) { p.Spec.Containers[0].Args = []string{"netexec"} },
+				)
+			}()
+			wg.Wait()
+
+			getExternalServerIP := func(ni netInfo, serverName string, family utilnet.IPFamily) string {
+				if hasMACVRF && serverName == ni.macVRFAgnhost {
+					overrideIPs, err := getMACVRFOverrideIPs(ni.spec)
+					gomega.Expect(err).NotTo(gomega.HaveOccurred())
+					return getFirstIPStringOfFamily(family, overrideIPs)
+				}
+				bgpServerNetwork, err := infraprovider.Get().GetNetwork(serverName)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				iface, err := infraprovider.Get().GetExternalContainerNetworkInterface(
+					infraapi.ExternalContainer{Name: serverName}, bgpServerNetwork,
+				)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				return getFirstIPStringOfFamily(family, []string{iface.IPv4, iface.IPv6})
+			}
+
+			ginkgo.By("Verifying each pod can reach its own VPN's external servers")
+			testForIPFamilies(ipFamilySet, func(family utilnet.IPFamily) {
+				for _, s := range nets[0].servers {
+					if ip := getExternalServerIP(nets[0], s, family); ip != "" {
+						framework.Logf("Pod A -> server %q at %s (own VPN)", s, ip)
+						testPodToHostnameAndExpect(podA, ip, s)
+					}
+				}
+				for _, s := range nets[1].servers {
+					if ip := getExternalServerIP(nets[1], s, family); ip != "" {
+						framework.Logf("Pod B -> server %q at %s (own VPN)", s, ip)
+						testPodToHostnameAndExpect(podB, ip, s)
+					}
+				}
+			})
+
+			ginkgo.By("Verifying cross-VPN isolation: pods cannot reach the other VPN's external servers")
+			testForIPFamilies(ipFamilySet, func(family utilnet.IPFamily) {
+				ownByIPA := map[string]string{}
+				for _, s := range nets[0].servers {
+					if ip := getExternalServerIP(nets[0], s, family); ip != "" {
+						ownByIPA[ip] = s
+					}
+				}
+				ownByIPB := map[string]string{}
+				for _, s := range nets[1].servers {
+					if ip := getExternalServerIP(nets[1], s, family); ip != "" {
+						ownByIPB[ip] = s
+					}
+				}
+
+				for _, s := range nets[1].servers {
+					ip := getExternalServerIP(nets[1], s, family)
+					if ip == "" {
+						continue
+					}
+					if own, overlap := ownByIPA[ip]; overlap {
+						framework.Logf("Pod A -> %s at %s (IP shared with %s; verifying reaches own VPN)", own, ip, s)
+						testPodToHostnameAndExpect(podA, ip, own)
+					} else {
+						framework.Logf("Pod A -X-> server %q at %s (other VPN, should fail)", s, ip)
+						testPodToClientIPNOK(podA, ip)
+					}
+				}
+				for _, s := range nets[0].servers {
+					ip := getExternalServerIP(nets[0], s, family)
+					if ip == "" {
+						continue
+					}
+					if own, overlap := ownByIPB[ip]; overlap {
+						framework.Logf("Pod B -> %s at %s (IP shared with %s; verifying reaches own VPN)", own, ip, s)
+						testPodToHostnameAndExpect(podB, ip, own)
+					} else {
+						framework.Logf("Pod B -X-> server %q at %s (other VPN, should fail)", s, ip)
+						testPodToClientIPNOK(podB, ip)
+					}
+				}
+			})
+
+			ginkgo.By("Verifying inter-CUDN isolation: pods cannot reach pods on the other overlapping network")
+			testForIPFamilies(ipFamilySet, func(family utilnet.IPFamily) {
+				podAIP, err := getPodAnnotationIPsForPrimaryNetworkByIPFamily(
+					f.ClientSet, podA.Namespace, podA.Name, networkNameA, family,
+				)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				podBIP, err := getPodAnnotationIPsForPrimaryNetworkByIPFamily(
+					f.ClientSet, podB.Namespace, podB.Name, networkNameB, family,
+				)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+				if podAIP != "" && podBIP != "" && podAIP == podBIP {
+					framework.Logf("Pods share IP %s; using hostname to confirm per-CUDN isolation", podAIP)
+					testPodToHostnameAndExpect(podA, podAIP, podA.Name)
+					testPodToHostnameAndExpect(podB, podBIP, podB.Name)
+				} else {
+					if podBIP != "" {
+						framework.Logf("Pod A -X-> Pod B at %s (inter-CUDN, should fail)", podBIP)
+						testPodToClientIPNOK(podA, podBIP)
+					}
+					if podAIP != "" {
+						framework.Logf("Pod B -X-> Pod A at %s (inter-CUDN, should fail)", podAIP)
+						testPodToClientIPNOK(podB, podAIP)
+					}
+				}
+			})
+		},
+		feature.EVPN,
+		ginkgo.Entry("Overlapping L3 CUDNs through different IP-VRF VPNs", overlappingL3IPVRFSpecGen),
+		ginkgo.Entry("Overlapping L2 CUDNs through different MAC-VRF VPNs", overlappingL2MACVRFSpecGen),
+		ginkgo.Entry("Overlapping L2 CUDNs through different MAC-VRF+IP-VRF VPNs", overlappingL2MACVRFIPVRFSpecGen),
 	)
 })
 
