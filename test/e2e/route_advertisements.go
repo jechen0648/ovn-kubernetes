@@ -2150,6 +2150,7 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 					macVRFNetworkName,
 					&ipVRFContainer,
 					ipVRFNetworkName,
+					nil,
 				),
 			).To(gomega.Succeed())
 			if networkSpec.EVPN.MACVRF != nil {
