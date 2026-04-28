@@ -657,8 +657,12 @@ func getMACVRFAgnhostIPsFromSubnets(subnets []string) ([]string, error) {
 //   - vid: VLAN ID for the access port on br0 (e.g., 100)
 //   - ipFamilies: Cluster IP family support (e.g., sets.New(utilnet.IPv4, utilnet.IPv6))
 //   - subnets: Subnets for the Docker network matching the CUDN (e.g., "10.100.0.0/16")
-func setupMACVRFAgnhost(ictx infraapi.Context, containerName, networkName, bridgeName string, vid int, ipFamilies sets.Set[utilnet.IPFamily], subnets []string) error {
-	// Derive agnhost IPs from CUDN subnets
+//   - reassignIPs: When true, the Docker network is created without explicit subnets
+//     (Docker picks a random unused range) and the container's IPs are reassigned
+//     afterward to match the CUDN subnets. This is needed when two MAC-VRF agnhosts
+//     share the same CUDN subnet because Docker rejects overlapping subnets. The Docker
+//     bridge still forwards L2 frames regardless of IP addressing.
+func setupMACVRFAgnhost(ictx infraapi.Context, containerName, networkName, bridgeName string, vid int, ipFamilies sets.Set[utilnet.IPFamily], subnets []string, reassignIPs bool) error {
 	agnhostIPs, err := getMACVRFAgnhostIPsFromSubnets(subnets)
 	if err != nil {
 		return fmt.Errorf("Failed to derive MAC-VRF agnhost IPs from subnets: %w", err)
@@ -673,9 +677,48 @@ func setupMACVRFAgnhost(ictx infraapi.Context, containerName, networkName, bridg
 		ip6 = ips6[0]
 	}
 
-	info, err := createEVPNAgnhost(ictx, networkName, containerName, ipFamilies, subnets, ip4, ip6)
+	var info *evpnAgnhostInfo
+	if reassignIPs {
+		info, err = createEVPNAgnhost(ictx, networkName, containerName, ipFamilies, nil, "", "")
+	} else {
+		info, err = createEVPNAgnhost(ictx, networkName, containerName, ipFamilies, subnets, ip4, ip6)
+	}
 	if err != nil {
 		return err
+	}
+
+	// When overlapping CUDNs share the same subnet, Docker rejects creating a
+	// second network with the same CIDR. In that case the caller sets
+	// reassignIPs so Docker picks a random subnet, and we reassign the
+	// container's IPs here to match the actual CUDN subnets.
+	if reassignIPs {
+		container := infraapi.ExternalContainer{Name: containerName}
+		if _, err := infraprovider.Get().ExecExternalContainerCommand(container,
+			[]string{"ip", "addr", "flush", "dev", info.agnhostInterface}); err != nil {
+			return fmt.Errorf("failed to flush Docker IPs on %s: %w", containerName, err)
+		}
+		// Docker creates IPv4-only networks by default, which disables IPv6 on
+		// the interface. Enable it so we can add IPv6 CUDN addresses.
+		if ipFamilies.Has(utilnet.IPv6) {
+			sysctlPath := fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6", info.agnhostInterface)
+			if _, err := infraprovider.Get().ExecExternalContainerCommand(container,
+				[]string{"sysctl", "-w", sysctlPath + "=0"}); err != nil {
+				return fmt.Errorf("failed to enable IPv6 on %s/%s: %w", containerName, info.agnhostInterface, err)
+			}
+		}
+		for i, subnet := range subnets {
+			_, ipNet, parseErr := net.ParseCIDR(subnet)
+			if parseErr != nil {
+				return fmt.Errorf("failed to parse CUDN subnet %s: %w", subnet, parseErr)
+			}
+			prefixLen, _ := ipNet.Mask.Size()
+			addr := fmt.Sprintf("%s/%d", agnhostIPs[i], prefixLen)
+			if _, err := infraprovider.Get().ExecExternalContainerCommand(container,
+				[]string{"ip", "addr", "add", addr, "dev", info.agnhostInterface}); err != nil {
+				return fmt.Errorf("failed to add CUDN IP %s on %s: %w", addr, containerName, err)
+			}
+		}
+		framework.Logf("Reassigned %s IPs to CUDN IPs: %v", containerName, agnhostIPs)
 	}
 
 	// Move FRR's interface to bridgeName and configure as access port
@@ -1232,6 +1275,23 @@ metadata:
 // EVPN Test Helpers
 // =============================================================================
 
+// sharedEVPNInfra holds pre-existing EVPN infrastructure names so that
+// multiple calls to runEVPNNetworkAndServers can share a single bridge,
+// VXLAN, VTEP, and set of VLAN IDs on the external FRR. When non-nil,
+// runEVPNNetworkAndServers skips creating the bridge/VXLAN/BGP/VTEP and
+// reuses the shared resources. The usedVIDs set is updated in place.
+type sharedEVPNInfra struct {
+	bridgeName string
+	vxlanName  string
+	vtepName   string
+	usedVIDs   sets.Set[int]
+	// reassignIPs indicates that Docker should pick a random subnet for
+	// MAC-VRF agnhosts instead of using the CUDN subnet. The IPs are
+	// reassigned afterward. Needed when two MAC-VRF agnhosts share the
+	// same CUDN subnet because Docker rejects overlapping CIDRs.
+	reassignIPs bool
+}
+
 func runEVPNNetworkAndServers(
 	f *framework.Framework,
 	ictx infraapi.Context,
@@ -1245,21 +1305,21 @@ func runEVPNNetworkAndServers(
 	macVRFNetworkName string,
 	ipVRFAgnhostName string,
 	ipVRFNetworkName string,
+	shared *sharedEVPNInfra,
 ) error {
-	// Derive what to setup from networkSpec
 	hasMACVRF := networkSpec.EVPN != nil && networkSpec.EVPN.MACVRF != nil
 	hasIPVRF := networkSpec.EVPN != nil && networkSpec.EVPN.IPVRF != nil
 
-	// Derive unique bridge/vxlan names from testBaseName for parallel isolation.
-	// e.g. testBaseName="evpn7a3f" → bridgeName="brevpn7a3f", vxlanName="vxevpn7a3f"
-	// keeping worst-case sviName ("brevpn9999.4094") at exactly 15 chars (Linux limit).
 	bridgeName := "br" + testName
 	vxlanName := "vx" + testName
+	if shared != nil {
+		bridgeName = shared.bridgeName
+		vxlanName = shared.vxlanName
+	}
 
 	ipVRFAgnhostSubnets = matchCIDRStringsByIPFamilySet(ipVRFAgnhostSubnets, ipFamilySet)
 	vtepSubnets = matchCIDRStringsByIPFamilySet(vtepSubnets, ipFamilySet)
 
-	// Extract subnets from networkSpec for MAC-VRF agnhost IP derivation
 	cudnSubnetsFromSpec := getNetworkSubnetsFromSpec(networkSpec)
 
 	externalFRRIP, err := getExternalFRRIP(ipFamilySet)
@@ -1267,22 +1327,39 @@ func runEVPNNetworkAndServers(
 		return err
 	}
 
-	// attach BGP peer network to all nodes
 	nodeList, err := f.ClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to list nodes: %w", err)
 	}
 	nodeIPs := e2enode.CollectAddresses(nodeList, corev1.NodeInternalIP)
 
-	framework.Logf("Setting up EVPN bridge on external FRR")
-	err = setupEVPNBridgeOnExternalFRR(ictx, externalFRRIP, bridgeName, vxlanName)
-	if err != nil {
-		return err
+	if shared == nil {
+		framework.Logf("Setting up EVPN bridge on external FRR")
+		err = setupEVPNBridgeOnExternalFRR(ictx, externalFRRIP, bridgeName, vxlanName)
+		if err != nil {
+			return err
+		}
 	}
 
-	var macVRFVID int
+	// nextVID returns a unique random VLAN ID, tracking used IDs across
+	// calls when sharing infrastructure with another network.
+	usedVIDs := sets.New[int]()
+	if shared != nil {
+		usedVIDs = shared.usedVIDs
+	}
+	nextVID := func() int {
+		for i := 0; i < 1000; i++ {
+			vid := randomVID()
+			if !usedVIDs.Has(vid) {
+				usedVIDs.Insert(vid)
+				return vid
+			}
+		}
+		panic("nextVID: exhausted 1000 attempts to find a unique VID")
+	}
+
 	if hasMACVRF {
-		macVRFVID = randomVID()
+		macVRFVID := nextVID()
 		framework.Logf("Generated random VIDs for external FRR: MAC-VRF VID=%d", macVRFVID)
 		framework.Logf("Setting up MAC-VRF on external FRR")
 		err = setupMACVRFOnExternalFRR(int(networkSpec.EVPN.MACVRF.VNI), macVRFVID, bridgeName, vxlanName)
@@ -1290,26 +1367,25 @@ func runEVPNNetworkAndServers(
 			return err
 		}
 
+		reassign := shared != nil && shared.reassignIPs
 		framework.Logf("Creating MAC-VRF agnhost")
-		err = setupMACVRFAgnhost(ictx, macVRFAgnhostName, macVRFNetworkName, bridgeName, macVRFVID, ipFamilySet, cudnSubnetsFromSpec)
+		err = setupMACVRFAgnhost(ictx, macVRFAgnhostName, macVRFNetworkName, bridgeName, macVRFVID, ipFamilySet, cudnSubnetsFromSpec, reassign)
 		if err != nil {
 			return err
 		}
 	}
 
-	framework.Logf("Setting up EVPN BGP on external FRR")
-	err = setupEVPNBGPOnExternalFRR(ictx, bgpASN, nodeIPs)
-	if err != nil {
-		return err
+	if shared == nil {
+		framework.Logf("Setting up EVPN BGP on external FRR")
+		err = setupEVPNBGPOnExternalFRR(ictx, bgpASN, nodeIPs)
+		if err != nil {
+			return err
+		}
 	}
 
 	if hasIPVRF {
-		// Derive VRF name from VNI (unique per IP-VRF)
 		ipVRFName := fmt.Sprintf("vrf%d", networkSpec.EVPN.IPVRF.VNI)
-		ipVRFVID := randomVID()
-		for macVRFVID == ipVRFVID {
-			ipVRFVID = randomVID()
-		}
+		ipVRFVID := nextVID()
 		framework.Logf("Generated random VIDs for external FRR: IP-VRF VID=%d", ipVRFVID)
 		framework.Logf("Setting up IP-VRF on external FRR")
 		err = setupIPVRFOnExternalFRR(ictx, ipVRFName, int(networkSpec.EVPN.IPVRF.VNI), ipVRFVID, bridgeName, vxlanName)
@@ -1317,15 +1393,12 @@ func runEVPNNetworkAndServers(
 			return err
 		}
 
-		// Derive names from VID
 		framework.Logf("Creating IP-VRF agnhost")
 		err = setupIPVRFAgnhost(ictx, ipVRFAgnhostName, ipVRFNetworkName, ipVRFName, ipVRFVID, ipFamilySet, ipVRFAgnhostSubnets...)
 		if err != nil {
 			return err
 		}
 
-		// Configure BGP AFTER agnhost so FRR's interface is in the VRF
-		// and has a connected route for the subnet we want to advertise
 		framework.Logf("Setting up IP-VRF BGP on external FRR")
 		err = setupIPVRFBGPOnExternalFRR(ictx, ipVRFName, bgpASN, int(networkSpec.EVPN.IPVRF.VNI), ipFamilySet, ipVRFAgnhostSubnets)
 		if err != nil {
@@ -1333,27 +1406,30 @@ func runEVPNNetworkAndServers(
 		}
 	}
 
-	framework.Logf("Ensuring VTEP loopback IPs on nodes")
-	err = ensureVTEPLoopbackIPs(f, ictx, vtepSubnets)
-	if err != nil {
-		return err
-	}
+	if shared == nil {
+		framework.Logf("Ensuring VTEP loopback IPs on nodes")
+		err = ensureVTEPLoopbackIPs(f, ictx, vtepSubnets)
+		if err != nil {
+			return err
+		}
 
-	testVTEPName := testName + "-vtep"
-	framework.Logf("Creating VTEP CR with subnets %v", vtepSubnets)
-	err = createVTEP(f, ictx, testVTEPName, vtepSubnets, vtepv1.VTEPModeUnmanaged)
-	if err != nil {
-		return err
-	}
+		testVTEPName := testName + "-vtep"
+		framework.Logf("Creating VTEP CR with subnets %v", vtepSubnets)
+		err = createVTEP(f, ictx, testVTEPName, vtepSubnets, vtepv1.VTEPModeUnmanaged)
+		if err != nil {
+			return err
+		}
 
-	framework.Logf("Waiting for VTEP %s to be accepted", testVTEPName)
-	err = waitForVTEPAccepted(f, testVTEPName, vtepSubnets)
-	if err != nil {
-		return fmt.Errorf("VTEP %s did not become healthy: %w", testVTEPName, err)
-	}
+		framework.Logf("Waiting for VTEP %s to be accepted", testVTEPName)
+		err = waitForVTEPAccepted(f, testVTEPName, vtepSubnets)
+		if err != nil {
+			return fmt.Errorf("VTEP %s did not become healthy: %w", testVTEPName, err)
+		}
 
-	// Update VTEP name in network spec
-	networkSpec.EVPN.VTEP = testVTEPName
+		networkSpec.EVPN.VTEP = testVTEPName
+	} else {
+		networkSpec.EVPN.VTEP = shared.vtepName
+	}
 
 	framework.Logf("Creating FRRConfiguration for EVPN")
 	frrConfigLabels := map[string]string{"network": testName}
@@ -1363,4 +1439,77 @@ func runEVPNNetworkAndServers(
 	}
 
 	return nil
+}
+
+// setupSharedEVPNInfra creates the shared bridge, VXLAN, BGP, and VTEP
+// resources on the external FRR that are common to two overlapping EVPN
+// networks. It returns a sharedEVPNInfra that both networks pass to
+// runEVPNNetworkAndServers so they reuse the same infrastructure.
+func setupSharedEVPNInfra(
+	f *framework.Framework,
+	ictx infraapi.Context,
+	testName string,
+	ipFamilySet sets.Set[utilnet.IPFamily],
+	vtepSubnets []string,
+	bgpASN int,
+	reassignIPs bool,
+) (*sharedEVPNInfra, error) {
+	bridgeName := "br" + testName
+	vxlanName := "vx" + testName
+
+	vtepSubnets = matchCIDRStringsByIPFamilySet(vtepSubnets, ipFamilySet)
+
+	externalFRRIP, err := getExternalFRRIP(ipFamilySet)
+	if err != nil {
+		return nil, err
+	}
+
+	nodeList, err := f.ClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list nodes: %w", err)
+	}
+	nodeIPs := e2enode.CollectAddresses(nodeList, corev1.NodeInternalIP)
+
+	framework.Logf("Setting up shared EVPN bridge on external FRR")
+	if err := setupEVPNBridgeOnExternalFRR(ictx, externalFRRIP, bridgeName, vxlanName); err != nil {
+		return nil, err
+	}
+
+	framework.Logf("Setting up EVPN BGP on external FRR")
+	if err := setupEVPNBGPOnExternalFRR(ictx, bgpASN, nodeIPs); err != nil {
+		return nil, err
+	}
+
+	framework.Logf("Ensuring VTEP loopback IPs on nodes")
+	if err := ensureVTEPLoopbackIPs(f, ictx, vtepSubnets); err != nil {
+		return nil, err
+	}
+
+	testVTEPName := testName + "-vtep"
+	framework.Logf("Creating shared VTEP CR with subnets %v", vtepSubnets)
+	if err := createVTEP(f, ictx, testVTEPName, vtepSubnets, vtepv1.VTEPModeUnmanaged); err != nil {
+		return nil, err
+	}
+
+	framework.Logf("Waiting for shared VTEP %s to be accepted", testVTEPName)
+	if err := waitForVTEPAccepted(f, testVTEPName, vtepSubnets); err != nil {
+		return nil, fmt.Errorf("VTEP %s did not become healthy: %w", testVTEPName, err)
+	}
+
+	return &sharedEVPNInfra{
+		bridgeName:  bridgeName,
+		vxlanName:   vxlanName,
+		vtepName:    testVTEPName,
+		usedVIDs:    sets.New[int](),
+		reassignIPs: reassignIPs,
+	}, nil
+}
+
+// getMACVRFOverrideIPs returns the actual CUDN IPs for a MAC-VRF agnhost
+// that had its IPs reassigned. This is needed because Docker reports the
+// originally assigned IPs, not the real CUDN IPs that were reassigned on
+// the container after creation.
+func getMACVRFOverrideIPs(networkSpec *udnv1.NetworkSpec) ([]string, error) {
+	cudnSubnets := getNetworkSubnetsFromSpec(networkSpec)
+	return getMACVRFAgnhostIPsFromSubnets(cudnSubnets)
 }
