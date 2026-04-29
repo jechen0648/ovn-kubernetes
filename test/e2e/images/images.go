@@ -23,7 +23,7 @@ var (
 	nginx                 = "nginx:1"
 	metallbLBService      = "quay.io/itssurya/dev-images:metallb-lbservice"
 	udpServerSrcIPPrinter = "quay.io/itssurya/dev-images:udp-server-srcip-printer"
-	frr                   = "quay.io/frrouting/frr:10.5.3"
+	frr = "quay.io/frrouting/frr:10.6.0" // match FRR_DEPLOYED_IMAGE in contrib/kind-common.sh
 
 	extraImages []string
 )
