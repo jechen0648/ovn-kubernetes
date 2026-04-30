@@ -34,7 +34,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/ovn-kubernetes/ovn-kubernetes/test/e2e/containerengine"
 	"github.com/ovn-kubernetes/ovn-kubernetes/test/e2e/images"
 	"github.com/ovn-kubernetes/ovn-kubernetes/test/e2e/infraprovider/frr"
 )
@@ -195,8 +194,6 @@ func main() {
 	fmt.Printf("Using control plane node: %s\n", controlPlaneNodeName)
 
 	// Set container engine based on config
-	// NOTE: This must be set before any calls to containerengine.Get() since
-	// the containerengine package caches the runtime value on first access.
 	if cfg.ContainerRuntime != "" {
 		os.Setenv("CONTAINER_RUNTIME", cfg.ContainerRuntime)
 	}
@@ -419,9 +416,13 @@ func nodeNames(nodes []corev1.Node) []string {
 	return names
 }
 
-// containerRuntime returns the container runtime command
+// containerRuntime returns the container runtime command.
+// Reads CONTAINER_RUNTIME env var (set from --container-runtime flag), defaulting to "docker".
 func containerRuntime() string {
-	return containerengine.Get().String()
+	if cr, found := os.LookupEnv("CONTAINER_RUNTIME"); found && cr != "" {
+		return cr
+	}
+	return defaultContainerRuntime
 }
 
 func runCmd(name string, args ...string) error {
