@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright The OVN-Kubernetes Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // bgp-setup is a standalone program that sets up BGP infrastructure for route advertisement testing.
 // It
 //   - deploys an external FRR container for BGP peering
@@ -657,6 +660,11 @@ func deployFRRExternalContainer(cfg *Config, nodes []corev1.Node) error {
 		return fmt.Errorf("failed to generate FRR configuration: %w", err)
 	}
 
+	// Minimal vtysh.conf silences "Can't open vtysh.conf" when vtysh starts (EVPN uses vtysh heavily).
+	if err := os.WriteFile(filepath.Join(frrConfigDir, "vtysh.conf"), []byte("!\n"), 0644); err != nil {
+		return fmt.Errorf("failed to write vtysh.conf: %w", err)
+	}
+
 	// Remove existing FRR container if present
 	if containerExists(frrContainerName) {
 		fmt.Println("Removing existing FRR container...")
@@ -665,13 +673,20 @@ func deployFRRExternalContainer(cfg *Config, nodes []corev1.Node) error {
 
 	// Create and run FRR container with config files mounted
 	fmt.Println("Creating FRR container with configuration...")
+	// frr.conf must be writable when EVPN is enabled: configureEVPN runs `write memory`, which
+	// updates /etc/frr/frr.conf.
+	frrConfMountOpt := "ro"
+	if cfg.EnableEVPN {
+		frrConfMountOpt = "rw"
+	}
 	args := []string{
 		"run", "-d", "--privileged",
 		"--name", frrContainerName,
 		"--network", kindNetwork,
 		"--hostname", frrContainerName,
-		"-v", fmt.Sprintf("%s/frr.conf:/etc/frr/frr.conf:ro", frrConfigDir),
+		"-v", fmt.Sprintf("%s/frr.conf:/etc/frr/frr.conf:%s", frrConfigDir, frrConfMountOpt),
 		"-v", fmt.Sprintf("%s/daemons:/etc/frr/daemons:ro", frrConfigDir),
+		"-v", fmt.Sprintf("%s/vtysh.conf:/etc/frr/vtysh.conf:ro", frrConfigDir),
 	}
 	// Enable IPv6 forwarding at container start if needed
 	if cfg.IPv6Enabled {
