@@ -6,6 +6,8 @@ package e2e
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
@@ -1392,14 +1394,19 @@ func runEVPNNetworkAndServers(
 	return nil
 }
 
-// cudnL2SVINameShort returns the L2 SVI interface name for an EVPN CUDN on a node.
-// For CUDNs with short names (<= 10 chars) it is "svl2-<name>" (max 15 chars).
-// Panics if the CUDN name exceeds 10 characters.
-func cudnL2SVINameShort(cudnName string) string {
-	if len(cudnName) > 10 {
-		panic(fmt.Sprintf("CUDN name %q exceeds 10 chars, interface name would exceed 15-char limit", cudnName))
+// evpnVxlanNameForVTEP returns the EVPN VXLAN device name for a VTEP CR name
+// (matches go-controller/pkg/node/controllers/evpn.GetEVPNVXLANName).
+func evpnVxlanNameForVTEP(vtepName string, fam utilnet.IPFamily) string {
+	prefix := "evx4"
+	if fam == utilnet.IPv6 {
+		prefix = "evx6"
 	}
-	return "svl2-" + cudnName
+	candidate := prefix + "-" + vtepName
+	if len(candidate) <= 15 {
+		return candidate
+	}
+	h := sha256.Sum256([]byte(vtepName))
+	return prefix + "." + hex.EncodeToString(h[:])[:8]
 }
 
 // evpnType2MACIPNLRI is the FRR/BGP print form of a Type-2 (MAC/IP) EVPN route NLRI.
