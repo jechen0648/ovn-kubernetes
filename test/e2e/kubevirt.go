@@ -1959,6 +1959,8 @@ write_files:
 					ipVRFAgnhostSubnets,
 					vtepSubnets,
 					bgpASN,
+					bgpASN,
+					routerContainerName,
 					&externalMACVRFContainer,
 					externalMACVRFContainer.Name,
 					&externalContainer,
