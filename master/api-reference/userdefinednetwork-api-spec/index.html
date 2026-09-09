@@ -2670,6 +2670,8 @@
       
         
       
+        
+      
     
     
     
@@ -2821,6 +2823,34 @@
     
   
     Dynamic UDN Node Allocation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../features/user-defined-networks/dhcp-ipam-localnet/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    DHCP IPAM for Localnet Networks
   
 
     
@@ -4381,6 +4411,8 @@
       
         
       
+        
+      
     
     
     
@@ -4881,6 +4913,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../okeps/okep-6800-egressip-node-selector/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    EgressIP Node Selector
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -4899,10 +4959,6 @@
       
         
           
-        
-      
-        
-      
         
       
         
@@ -4965,65 +5021,27 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../../blog/dpu-acceleration/" class="md-nav__link">
+    
+    
+      
         
-  
-  
-  <span class="md-ellipsis">
+      
     
-  
-    Accelerating and Securing Kubernetes Networking with DPUs
-  
-
     
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_9_2">
+        
+          
+          <label class="md-nav__link" for="__nav_9_2" id="__nav_9_2_label" tabindex="0">
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../blog/netobserv/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Debugging NetworkPolicies with NetObserv
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../.." class="md-nav__link">
-        
   
   
   <span class="md-ellipsis">
@@ -5037,7 +5055,53 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_9_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_9_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Archive
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix="">
+            
+              
+                
+  
+  
+  
+    
+  
+  
+    <li class="md-nav__item">
+      <a href="../../blog/archive/2026/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    2026
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -5669,6 +5733,12 @@
 <td>Conditions slice of condition objects indicating details about ClusterUserDefineNetwork status.</td>
 <td></td>
 <td></td>
+</tr>
+<tr>
+<td><code>vrfName</code> <em>string</em></td>
+<td>VRFName is the name of the Linux VRF device that OVN-Kubernetes creates<br>for this network on every node where the network is present. It is<br>populated for primary networks. Consumers that must name the VRF, such<br>as FRRConfiguration authors filling in the routers 'vrf' field, should<br>read this value instead of deriving it.</td>
+<td></td>
+<td>MaxLength: 15 <br></td>
 </tr>
 </tbody>
 </table>
@@ -6355,6 +6425,12 @@ See: https://docs.frrouting.org/en/stable-8.5/bgp.html#evpn-l3-route-targets</p>
 <td></td>
 <td></td>
 <td></td>
+</tr>
+<tr>
+<td><code>vrfName</code> <em>string</em></td>
+<td>VRFName is the name of the Linux VRF device that OVN-Kubernetes creates<br>for this network on every node where the network is present. It is<br>populated for primary networks. Consumers that must name the VRF, such<br>as FRRConfiguration authors filling in the routers 'vrf' field, should<br>read this value instead of deriving it.</td>
+<td></td>
+<td>MaxLength: 15 <br></td>
 </tr>
 </tbody>
 </table>

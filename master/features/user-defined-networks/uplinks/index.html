@@ -2228,6 +2228,8 @@
       
         
       
+        
+      
     
     
     
@@ -2558,6 +2560,34 @@
     
   
     Dynamic UDN Node Allocation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../dhcp-ipam-localnet/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    DHCP IPAM for Localnet Networks
   
 
     
@@ -4118,6 +4148,8 @@
       
         
       
+        
+      
     
     
     
@@ -4618,6 +4650,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../okeps/okep-6800-egressip-node-selector/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    EgressIP Node Selector
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -4636,10 +4696,6 @@
       
         
           
-        
-      
-        
-      
         
       
         
@@ -4702,65 +4758,27 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../../../blog/dpu-acceleration/" class="md-nav__link">
+    
+    
+      
         
-  
-  
-  <span class="md-ellipsis">
+      
     
-  
-    Accelerating and Securing Kubernetes Networking with DPUs
-  
-
     
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_9_2">
+        
+          
+          <label class="md-nav__link" for="__nav_9_2" id="__nav_9_2_label" tabindex="0">
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../../blog/netobserv/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Debugging NetworkPolicies with NetObserv
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../.." class="md-nav__link">
-        
   
   
   <span class="md-ellipsis">
@@ -4774,7 +4792,53 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_9_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_9_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Archive
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix="">
+            
+              
+                
+  
+  
+  
+    
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../blog/archive/2026/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    2026
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -5249,10 +5313,35 @@ bridge interface is enslaved to the CUDN Linux VRF on regular nodes. In DPU
 deployments, the DPU-local bridge interface is attached to the CUDN VRF on the
 DPU side. FRR peers in that VRF, and ovnkube reflects the routes learned in
 that VRF into the OVN gateway routers for the CUDN.</p>
+<p>On enslavement and release, OVN-Kubernetes migrates the interface's eligible
+unicast routes into and out of the VRF routing table. This includes the
+kernel-protocol prefix routes of <code>noprefixroute</code> addresses (for example on
+NetworkManager-managed interfaces) and excludes routes that OVN-Kubernetes or
+routing daemons such as FRR program per routing domain themselves. The
+migration is one-shot: an agent that keeps reconciling its routes only into
+the main table, such as NetworkManager on a lease renewal, leaves the migrated
+copy stale until the next enslavement.</p>
+<div class="highlight"><pre><span></span><code>             OVN-Kubernetes           kernel              main-table agent
+ enslave     capture main routes ---&gt; purges iface routes
+             restore into VRF
+ (running)                                                updates main only:
+                                                          VRF copy now stale
+ release     capture VRF routes ----&gt; purges iface routes
+             restore into main
+ re-enslave  capture main routes ---&gt; purges iface routes
+             restore into VRF: copy fresh again
+</code></pre></div>
 <p>Multiple Dynamic CUDNs may use the same Uplink with <code>targetVRF: auto</code> when
 their active node sets do not overlap. If more than one such CUDN becomes
 active on the same node, the Uplink bridge cannot be attached to both CUDN
 VRFs and OVN-Kubernetes reports <code>UplinkConfigurationConflict</code>.</p>
+<p>For every primary CUDN, OVN-Kubernetes publishes the name of the Linux VRF
+device it creates on every node where the network is present in the CUDN
+<code>status.vrfName</code> field. Consumers that must name the VRF explicitly, such as
+FRRConfiguration authors filling in the routers <code>vrf</code> field, should read this
+value instead of deriving it: the derivation rule (the CUDN name when it fits
+within the kernel's 15-character interface name limit, an ID-derived name
+otherwise) is an internal implementation detail that may change.</p>
 <p>Example RouteAdvertisements for VRF-Lite:</p>
 <div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">k8s.ovn.org/v1</span>
 <span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">RouteAdvertisements</span>
