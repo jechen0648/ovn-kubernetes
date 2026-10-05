@@ -1,6 +1,6 @@
-# OKEP-XXXX: BGP NodeSelector for PodNetwork RouteAdvertisements
+# OKEP-7040: BGP NodeSelector for PodNetwork RouteAdvertisements
 
-* Issue: [#XXXX](https://github.com/ovn-kubernetes/ovn-kubernetes/issues/XXXX)
+* Issue: [#7040](https://github.com/ovn-kubernetes/ovn-kubernetes/issues/7040)
 
 ## Problem Statement
 
@@ -12,32 +12,45 @@ gateway nodes while maintaining full pod reachability from the external network.
 
 ## Goals
 
-* Allow `nodeSelector` to select a subset of nodes when advertising `PodNetwork`
-  in `RouteAdvertisements`.
-* Gateway nodes advertise pod subnets for **all** nodes, not just their own.
-* Support both ingress (external to pod) and egress (pod to BGP-learned
-  destination) traffic through gateway nodes.
-* Support both shared gateway (SGW) and local gateway (LGW) modes.
-* Support overlay (Geneve) and EVPN (VXLAN) transports.
-* Provide ECMP load-balancing and high-availability across multiple gateway
+* Allow `nodeSelector` to select a subset of **BGP gateway** nodes when
+  `PodNetwork` is advertised, for the **default cluster network** and for
+  **primary Layer 2 and Layer 3** cluster user-defined networks (CUDNs).
+* Gateway nodes advertise routes so pods on **non-gateway** nodes remain
+  reachable from the provider network and can egress to BGP-learned
+  destinations via gateway nodes.
+* Align advertisement semantics with [#7040](https://github.com/ovn-kubernetes/ovn-kubernetes/issues/7040):
+  per-node host subnets on gateways, plus the **Layer 3 cluster supernet**
+  where applicable.
+* Support ingress (external → pod) and egress (pod → BGP-learned external)
+  through gateway nodes in **shared gateway (SGW)** and **local gateway (LGW)**
+  modes with **overlay (Geneve)** and **EVPN (VXLAN)** transports.
+* Provide ECMP load-balancing and high availability across multiple gateway
   nodes.
+* Preserve `EgressIP` `nodeSelector` expected behavior when combined with
+  `PodNetwork` `nodeSelector` selection.
+* **Non-gateway nodes do not require FRR** for `PodNetwork` advertisement on
+  the selected network.
 
 ## Non-Goals
 
-* Support for no-overlay transport with `nodeSelector` for `PodNetwork` — there
-  is no tunnel backplane to forward remote pod traffic.
-* Replacing or modifying the existing EgressIP reroute mechanism.
-* Automatic scheduling of workloads on gateway nodes — users may schedule pods
-  on any node.
+* `nodeSelector` + `PodNetwork` when any selected network uses **NoOverlay**
+  transport (no tunnel backplane for steering non-gateway traffic).
+* Replacing or changing EgressIP assignment or SNAT semantics beyond
+  documented interaction with gateway reroute policies.
+* Automatic scheduling of workloads on gateway nodes.
+* **Non-interconnect (non-IC)** clusters unless route-advertisements IC
+  prerequisite is lifted — nexthop selection is specified for IC first; join
+  switch nexthops are noted as a future extension.
+* Mandatory **ECMP-symmetric reply** (explored as a follow-up).
 
 ## Introduction
 
-The original BGP OKEP ([OKEP-5296](okep-5296-bgp.md)) listed "Allow selecting
-only a subset of nodes to advertise BGP" as a future goal. This OKEP fulfills
+The original BGP OKEP ([OKEP-5296](okep-5296-bgp.md)) listed “Allow selecting
+only a subset of nodes to advertise BGP” as a future goal. This OKEP fulfills
 that goal for `PodNetwork` advertisements.
 
 In many datacenter deployments, only a subset of nodes are connected to BGP
-peers on the provider network. These "gateway nodes" act as the entry and exit
+peers on the provider network. These “gateway nodes” act as the entry and exit
 points for north/south traffic. Today, the `RouteAdvertisements` CRD enforces
 that `PodNetwork` must be advertised on all nodes, which prevents this
 deployment pattern.
@@ -81,6 +94,20 @@ As a cluster admin, I want to advertise a Layer3 ClusterUserDefinedNetwork's pod
 subnets through designated gateway nodes, with each UDN's routes advertised in
 its corresponding VRF.
 
+### Story 4: Primary L2 CUDN through gateways
+
+As a cluster admin, I want Layer 2 primary CUDN `PodNetwork` reachability when
+only gateway nodes peer with BGP: gateways advertise the **cluster subnet** and
+terminate north-south ingress on br-ex; remote pods are reached via Geneve to
+the correct logical switch.
+
+### Story 5: EgressIP continues to work with gateway `nodeSelector`
+
+As a cluster admin, I use EgressIP with its own node selection while also using
+`RouteAdvertisements` with a `nodeSelector` for `PodNetwork`. EgressIP
+reroute and no-reroute policies must keep working for affected pods; EgressIP
+must not be broken by gateway reroute policies.
+
 ## Proposed Solution
 
 ### API Details
@@ -90,28 +117,61 @@ its corresponding VRF.
 Remove the existing CEL validation on `RouteAdvertisementsSpec` that blocks
 `nodeSelector` with `PodNetwork`:
 
-```
+```text
 // REMOVE:
 // +kubebuilder:validation:XValidation:rule="(!has(self.nodeSelector.matchLabels) && !has(self.nodeSelector.matchExpressions)) || !('PodNetwork' in self.advertisements)"
 // message="If 'PodNetwork' is selected for advertisement, a 'nodeSelector' can't be specified as it needs to be advertised on all nodes"
 ```
 
-No new API fields are required. The existing `nodeSelector` field gains
-additional semantics when used with `PodNetwork`.
+No new API fields are required. The existing `nodeSelector` field gains the
+semantics described in this OKEP when used with `PodNetwork`.
 
 #### Runtime validation
 
-A controller-level validation rejects `nodeSelector` with `PodNetwork` when any
-selected network uses `transport: NoOverlay`:
+* Reject `nodeSelector` with `PodNetwork` when any selected network uses
+  `transport: NoOverlay` (controller-level, not CEL — transport comes from the
+  selected network, not the `RouteAdvertisements` spec):
+  `"nodeSelector is not supported for PodNetwork when selected networks use
+  NoOverlay transport"`.
+* If `nodeSelector` matches **zero** ready nodes, `RouteAdvertisements` status
+  is degraded or pending until at least one gateway node exists; no
+  `FRRConfiguration` objects are generated in that state.
+* If a selected gateway node has no matching `FRRConfiguration` (per
+  `frrConfigurationSelector`), surface an error in `RouteAdvertisements`
+  status for that node.
+* Multiple `RouteAdvertisements` objects for the same network continue to use
+  existing conflict rules; operators should avoid overlapping gateway sets
+  across objects unless that is intentional.
 
-```
-"nodeSelector is not supported for PodNetwork when selected networks use
-NoOverlay transport"
-```
+### Scope matrix
 
-This is enforced at the controller level (not CEL) because it requires
-cross-resource validation — the transport is determined from the selected
-network's configuration, not from the `RouteAdvertisements` spec itself.
+| Network | Topology | Transport | `nodeSelector` + `PodNetwork` |
+|---------|----------|-----------|-------------------------------|
+| Default cluster network | L3 | Geneve (overlay) | **Supported** |
+| Default cluster network | — | NoOverlay | **Rejected** |
+| Primary L3 CUDN | Layer3 | Overlay | **Supported** |
+| Primary L3 CUDN | Layer3 | EVPN | **Supported** |
+| Primary L2 CUDN | Layer2 | Overlay | **Supported** (cluster subnet on gateways) |
+| Primary L2 CUDN | Layer2 | EVPN | **Supported** (cluster subnet on gateways) |
+| Primary L2 CUDN | Layer2 | NoOverlay | **Rejected** |
+
+Route Advertisements today is **interconnect (IC) only** for full feature
+parity in docs; gateway reroute nexthops are **transit switch port IPs** of
+gateway nodes in IC. Non-IC clusters using join switch IPs are a documented
+extension once RA supports non-IC.
+
+#### EVPN (VXLAN) considerations
+
+EVPN CUDNs use the same gateway pattern as Geneve overlay: gateways advertise
+prefixes and program br-ex; non-gateway nodes use cluster-router reroute to
+gateway transit IPs. Implementation must align EVPN-specific behavior from
+[OKEP-5088](okep-5088-evpn.md) with gateway-only FRR — in particular,
+separating **network-level** `PodNetwork` advertisement (SNAT, global semantics)
+from **per-node** gateway membership. Today `IsPodNetworkAdvertisedAtNode` can
+report advertised for all nodes on EVPN networks; that logic is extended so
+only gateway nodes run FRR and install north-south br-ex flows while non-gateway
+pods retain correct pod-IP egress after reroute. VTEP and IP-VRF/MAC-VRF
+advertisement rules follow the EVPN OKEP on **gateway** nodes only.
 
 ### Implementation Details
 
@@ -129,34 +189,34 @@ When `nodeSelector` is non-empty and `PodNetwork` is in `advertisements`:
    advertises the host subnets of **all** nodes (not just its own). For Layer2
    networks, no change is needed — all nodes already advertise the cluster-wide
    network subnet.
+4. On **node add**: allocate host subnet, add prefix to every gateway's
+   advertisement and br-ex remote flow set; add reroute policy row for that
+   subnet if the node is non-gateway.
+5. On **node delete**: withdraw prefix from gateways and remove stale policies
+   / flows.
 
 The generated per-node `FRRConfiguration` for a gateway node will contain
 prefixes for all nodes' host subnets:
 
 ```yaml
-# Generated for gateway node ovn-worker:
 spec:
   nodeSelector:
     matchLabels:
-      kubernetes.io/hostname: ovn-worker
+      kubernetes.io/hostname: node1
   bgp:
     routers:
       - asn: 64512
         prefixes:
-          - 10.244.0.0/24   # ovn-worker3's subnet
-          - 10.244.1.0/24   # ovn-control-plane's subnet
-          - 10.244.2.0/24   # ovn-worker's own subnet
-          - 10.244.3.0/24   # ovn-worker2's subnet
+          - 10.244.0.0/24   # node1 (self)
+          - 10.244.1.0/24   # node2
+          - 10.244.2.0/24   # node3
+          - 10.244.0.0/16   # L3 cluster supernet (default network example)
         neighbors:
           - asn: 64513
             address: 192.168.1.1
             toAdvertise:
               allowed:
-                prefixes:
-                  - 10.244.0.0/24
-                  - 10.244.1.0/24
-                  - 10.244.2.0/24
-                  - 10.244.3.0/24
+                prefixes: # same set as prefixes above
 ```
 
 #### Data Plane: Ingress (External → Pod on non-gateway node)
@@ -310,6 +370,14 @@ EGRESS (pod on ovn-worker3 → BGP-learned external destination):
 | Egress reroute                 | OVN LRP on cluster router      | Same — reroute happens before SGW/LGW split                 |
 | SNAT handling                  | Conditional SNAT on GR         | Conditional SNAT on GR + host nftables                      |
 
+#### EgressIP compatibility
+
+* EgressIP **nodeSelector** / assignable labels are unchanged.
+* EgressIP reroute takes precedence over BGP gateway reroute for pods selected
+  by EgressIP; east-west traffic remains protected by existing no-reroute rules.
+* Regression tests on a **2+1** cluster: EgressIP on gateway vs non-gateway;
+  pods on Node3 with and without EgressIP.
+
 ### Testing Details
 
 #### Unit Tests
@@ -323,13 +391,19 @@ EGRESS (pod on ovn-worker3 → BGP-learned external destination):
   * Add test: reject `nodeSelector` + `PodNetwork` with `NoOverlay` transport.
   * Add test: Layer2 networks use cluster-wide subnets regardless of
     `nodeSelector`.
+  * Add test: `nodeSelector` matching zero ready nodes reports degraded or
+    pending status and does not generate `FRRConfiguration` objects.
+
+* **networkmanager**: Test `syncRouteAdvertisements` / `podAdvertisements`
+  when only a subset of nodes are BGP gateways.
 
 * **OVN network controller**: Test that breth0 flows are created for remote pod
   subnets on gateway nodes.
 
 * **Logical router policy**: Test that reroute policies are created on
   `ovn_cluster_router` for non-gateway node subnets with gateway node transit
-  switch IPs as nexthops.
+  switch IPs as nexthops. Also cover interaction with EgressIP, per-network
+  cluster routers (UDN), IPv6, and exclusion of gateway-local pod subnets.
 
 #### E2E Tests
 
@@ -346,6 +420,17 @@ EGRESS (pod on ovn-worker3 → BGP-learned external destination):
 * Verify the updated CEL validation allows `nodeSelector` with `PodNetwork`.
 * Verify no regression in existing validation rules.
 
+#### Scale Testing
+
+* Many nodes with few gateways: BGP prefix count, FRR reconcile latency, and
+  breth0 flow count as nodes scale.
+
+#### Cross-Feature Testing
+
+* **EgressIP**: precedence vs BGP gateway reroute, health checks.
+* **advertised-udn-isolation**, **VRF-Lite**, and **MEG / admin policies** as
+  applicable to gateway-only advertisement.
+
 ### Documentation Details
 
 * Update `docs/features/bgp-integration/route-advertisements.md`:
@@ -354,6 +439,7 @@ EGRESS (pod on ovn-worker3 → BGP-learned external destination):
   * Add a new section on gateway node deployment pattern with examples.
   * Document the NoOverlay restriction.
 * Update the `RouteAdvertisements` API reference documentation.
+* Add `mkdocs.yml` entry for this OKEP.
 
 ## Risks, Known Limitations and Mitigations
 
@@ -372,6 +458,9 @@ EGRESS (pod on ovn-worker3 → BGP-learned external destination):
   for pods with EgressIP. Traffic from those pods is directed to the EgressIP
   node, not the BGP gateway node. This is the expected behavior — EgressIP
   controls source IP selection.
+* **Empty gateway selection**: If `nodeSelector` matches no ready nodes,
+  `RouteAdvertisements` does not generate gateway `FRRConfiguration` objects
+  until at least one gateway node is available.
 
 ## OVN-Kubernetes Version Skew
 
@@ -387,7 +476,7 @@ milestones for the next release window.
   behavior is identical to today — each node advertises only its own host
   subnet. The new "advertise all nodes' subnets" behavior only activates when
   `nodeSelector` is non-empty.
-* **E2E tests**: Existing BGP E2E tests should continue to pass without
+* **E2E tests**: Existing BGP/EVPN E2E tests should continue to pass without
   modification. New E2E tests will be added for the gateway node pattern.
 
 ## Alternatives
@@ -425,6 +514,7 @@ when only gateway nodes have BGP peering.
 
 * [OKEP-5296: OVN-Kubernetes BGP Integration](okep-5296-bgp.md) — original BGP
   OKEP listing node selection as a future goal.
+* [GitHub issue #7040](https://github.com/ovn-kubernetes/ovn-kubernetes/issues/7040)
 * [Route Advertisements documentation](../features/bgp-integration/route-advertisements.md)
 * [OVN Logical Router Policy](https://www.ovn.org/support/dist-docs/ovn-nb.5.html)
   — `Logical_Router_Policy` table with `reroute` action and multiple `nexthops`.
