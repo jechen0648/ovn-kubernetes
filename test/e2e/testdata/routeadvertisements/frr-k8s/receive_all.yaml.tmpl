@@ -1,0 +1,29 @@
+{{- define "receive_all.yaml" -}}
+apiVersion: frrk8s.metallb.io/v1beta1
+kind: FRRConfiguration
+metadata:
+  name: receive-all
+  labels:
+    name: receive-all
+spec:
+  bgp:
+    routers:
+    - asn: 64512
+      neighbors:
+{{- range .NeighborsIPv4 }}
+      - address: {{ . }}
+        asn: 64512
+        disableMP: true
+        toReceive:
+          allowed:
+            mode: all
+{{- end }}
+{{- range .NeighborsIPv6 }}
+      - address: {{ . }}
+        asn: 64512
+        disableMP: true
+        toReceive:
+          allowed:
+            mode: all
+{{- end }}
+{{ end }}

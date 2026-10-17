@@ -90,6 +90,11 @@ data:
     kubelet-cgroup-path = {{ .Values.global.kubeletCgroupPath }}
 {{- end }}
 {{- end }}
+{{- if hasKey .Values.global "egressIpReachabilityTotalTimeout" }}
+
+    [ovnkubernetesfeature]
+    egressip-reachability-total-timeout = {{ .Values.global.egressIpReachabilityTotalTimeout }}
+{{- end }}
 
 {{- if or .Values.global.skipCallToK8s (eq (include "needNamespace" $hostNetworkNamespace) "true") }}
 ---

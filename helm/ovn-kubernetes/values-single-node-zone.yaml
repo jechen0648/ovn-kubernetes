@@ -59,6 +59,8 @@ global:
   enableEgressIp: true
   # -- Configure EgressIP node reachability using gRPC on this TCP port
   egressIpHealthCheckPort: 9107
+  # -- Max seconds for egress node reachability probes (0 disables checks). Set on cluster-manager via ovnkube.conf.
+  # egressIpReachabilityTotalTimeout: 0
   # -- Configure to use EgressService CRD feature with ovn-kubernetes
   enableEgressService: true
   # -- Configure to use EgressFirewall CRD feature with ovn-kubernetes
